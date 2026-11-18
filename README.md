@@ -15,7 +15,7 @@ Suíte local de inteligência e curadoria para analisar, decompor, comparar, agr
   6. `estilo`
   7. `projeto_cliente`
   8. `estrutura`
-  *(Consulte o esquema completo em [docs/DATA_MODEL_AND_SCHEMA.md](docs/DATA_MODEL_AND_SCHEMA.md).)*
+  *(Consulte o esquema de dados em [docs/DATA_MODEL_AND_SCHEMA.md](docs/DATA_MODEL_AND_SCHEMA.md) e o histórico completo de criação em [docs/CREATION_DOCUMENTATION.md](docs/CREATION_DOCUMENTATION.md).)*
 
 - **Duplo Eixo — Raridade × Maturidade**:
   - **Raridade**: calculada por frequência inversa (IDF médio + bônus de co-ocorrência), expressa como percentil em fonte monoespaçada (`"mais raro que XX% da coleção"`) e convertida nos **Tiers sóbrios `S`–`D`** (`#e5a93c` reservado ao `Tier S`).
