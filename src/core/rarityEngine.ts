@@ -8,17 +8,70 @@ import type {
 } from '../types/promptEngine'
 import { clamp } from './vectorMath'
 
+export const TIER_COLOR_META: Record<
+  RarityTier,
+  {
+    hex: string
+    badgeClass: string
+    textClass: string
+    borderClass: string
+    bgSubtleClass: string
+    barColor: string
+  }
+> = {
+  S: {
+    hex: '#e8b84b',
+    badgeClass: 'border-[#e8b84b]/60 bg-[#e8b84b]/10 text-[#e8b84b]',
+    textClass: 'text-[#e8b84b]',
+    borderClass: 'border-[#e8b84b]/45 hover:border-[#e8b84b]/75',
+    bgSubtleClass: 'bg-[#e8b84b]/10',
+    barColor: '#e8b84b',
+  },
+  A: {
+    hex: '#a855f7',
+    badgeClass: 'border-purple-500/55 bg-purple-500/10 text-purple-300',
+    textClass: 'text-purple-400',
+    borderClass: 'border-purple-500/35 hover:border-purple-400/65',
+    bgSubtleClass: 'bg-purple-500/10',
+    barColor: '#a855f7',
+  },
+  B: {
+    hex: '#3b82f6',
+    badgeClass: 'border-blue-500/50 bg-blue-500/10 text-blue-300',
+    textClass: 'text-blue-400',
+    borderClass: 'border-blue-500/30 hover:border-blue-400/60',
+    bgSubtleClass: 'bg-blue-500/10',
+    barColor: '#3b82f6',
+  },
+  C: {
+    hex: '#64748b',
+    badgeClass: 'border-slate-500/45 bg-slate-500/10 text-slate-300',
+    textClass: 'text-slate-400',
+    borderClass: 'border-slate-500/25 hover:border-slate-400/50',
+    bgSubtleClass: 'bg-slate-500/10',
+    barColor: '#64748b',
+  },
+  D: {
+    hex: '#52525b',
+    badgeClass: 'border-zinc-600/45 bg-zinc-700/15 text-zinc-400',
+    textClass: 'text-zinc-500',
+    borderClass: 'border-white/[0.07] hover:border-white/[0.18]',
+    bgSubtleClass: 'bg-zinc-600/10',
+    barColor: '#52525b',
+  },
+}
+
 export const TIER_THRESHOLDS: ReadonlyArray<{
   tier: RarityTier
   minPercentile: number
   label: string
   description: string
 }> = [
-  { tier: 'S', minPercentile: 95, label: 'Tier S', description: 'Top 5% — raro na coleção' },
-  { tier: 'A', minPercentile: 80, label: 'Tier A', description: '80–94% — alta originalidade' },
-  { tier: 'B', minPercentile: 50, label: 'Tier B', description: '50–79% — repertório intermediário' },
-  { tier: 'C', minPercentile: 20, label: 'Tier C', description: '20–49% — padrão recorrente' },
-  { tier: 'D', minPercentile: 0, label: 'Tier D', description: '0–19% — alta repetição' },
+  { tier: 'S', minPercentile: 95, label: 'Tier S', description: 'Top 5%: raro na coleção' },
+  { tier: 'A', minPercentile: 80, label: 'Tier A', description: '80 a 94%: alta originalidade' },
+  { tier: 'B', minPercentile: 50, label: 'Tier B', description: '50 a 79%: repertório intermediário' },
+  { tier: 'C', minPercentile: 20, label: 'Tier C', description: '20 a 49%: padrão recorrente' },
+  { tier: 'D', minPercentile: 0, label: 'Tier D', description: '0 a 19%: alta repetição' },
 ]
 
 export const QUADRANT_META: Record<

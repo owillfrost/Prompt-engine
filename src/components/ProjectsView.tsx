@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { Clock3, Compass, FolderKanban, Grid2x2, Layers, Sparkles } from 'lucide-react'
 import { formatTagPt } from '../core/promptTagsPt'
 import type { ProjectSummaryRecord, PromptItem, SourceLibFilter } from '../types/promptEngine'
+import { PromptThumb } from './PromptThumb'
 import { RefinementStudioPanel } from './RefinementStudioPanel'
 import { TimelineEvolutionPanel } from './TimelineEvolutionPanel'
 
@@ -59,7 +60,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
             Projetos, Lapidação Raro + Imaturo &amp; Linha do Tempo
           </h1>
           <p className="mt-1 text-[13px] text-zinc-400">
-            Explore padrões por pasta, resgate ideias raras ainda sem molde consolidado (Raro + Imaturo → Raro + Maduro) e identifique ingredientes adormecidos por safra.
+            Explore padrões por pasta, resgate ideias raras ainda sem molde consolidado (Raro + Imaturo para Raro + Maduro) e identifique ingredientes adormecidos por safra.
           </p>
         </div>
 
@@ -275,12 +276,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
                         title={`${ex.title} · ${ex.rarity.label}`}
                       >
                         {ex.thumbnailUrl ? (
-                          <img
-                            src={ex.thumbnailUrl}
-                            alt={ex.title}
-                            loading="lazy"
-                            className="h-full w-full object-cover"
-                          />
+                          <PromptThumb src={ex.thumbnailUrl} alt={ex.title} fallbackLabel="·" />
                         ) : null}
                       </button>
                     ))}

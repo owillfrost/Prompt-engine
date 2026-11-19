@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowRight, Maximize2, RotateCcw, Search, ZoomIn, ZoomOut } from 'lucide-react'
+import { Compass, MapPin, Maximize2, RotateCcw, Search, ZoomIn, ZoomOut } from 'lucide-react'
 import { formatTagPt } from '../core/promptTagsPt'
-import { QUADRANT_META } from '../core/rarityEngine'
+import { QUADRANT_META, TIER_COLOR_META } from '../core/rarityEngine'
+import { PromptThumb } from './PromptThumb'
 import type {
   MapClusterRegion,
   MapPayload,
@@ -26,6 +27,8 @@ interface MapViewProps {
 type ProjectionMode = 'semantic' | 'structural'
 type QuickFilter = 'all' | 'tier_s' | 'raro_maduro' | 'raro_imaturo'
 
+const PULSE_DURATION_MS = 900
+
 export const MapView: React.FC<MapViewProps> = ({
   mapData,
   sourceLib,
@@ -40,6 +43,8 @@ export const MapView: React.FC<MapViewProps> = ({
 
   const [points, setPoints] = useState<MapPointCompact[]>([])
   const [loadingPoints, setLoadingPoints] = useState(true)
+  const [pointsError, setPointsError] = useState<string | null>(null)
+  const [reloadPointsNonce, setReloadPointsNonce] = useState(0)
 
   const [projection, setProjection] = useState<ProjectionMode>('semantic')
   const [quickFilter, setQuickFilter] = useState<QuickFilter>('all')
@@ -70,6 +75,10 @@ export const MapView: React.FC<MapViewProps> = ({
   const [selectedClusterId, setSelectedClusterId] = useState<number | null>(null)
   const [selectedVoidId, setSelectedVoidId] = useState<string | null>(null)
 
+  const pulseStateRef = useRef<{ clusterId: number; startTime: number } | null>(null)
+  const pulseRafRef = useRef<number | null>(null)
+  const drawCanvasRef = useRef<(now?: number) => void>(() => {})
+
   const activeClusters: MapClusterRegion[] =
     projection === 'semantic' ? mapData.clusters : mapData.structuralClusters
 
@@ -77,21 +86,27 @@ export const MapView: React.FC<MapViewProps> = ({
   useEffect(() => {
     let active = true
     setLoadingPoints(true)
+    setPointsError(null)
     const params = new URLSearchParams({ sourceLib, project: activeProjectFilter })
     fetch(`/api/map-points?${params.toString()}`)
-      .then((r) => r.json() as Promise<MapPointsResponse>)
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        return (await r.json()) as MapPointsResponse
+      })
       .then((data) => {
         if (!active) return
         setPoints(data.points || [])
         setLoadingPoints(false)
       })
-      .catch(() => {
-        if (active) setLoadingPoints(false)
+      .catch((err: unknown) => {
+        if (!active) return
+        setPointsError(err instanceof Error ? err.message : 'Falha ao carregar nuvem de pontos.')
+        setLoadingPoints(false)
       })
     return () => {
       active = false
     }
-  }, [sourceLib, activeProjectFilter])
+  }, [sourceLib, activeProjectFilter, reloadPointsNonce])
 
   const getPointCoords = useCallback(
     (p: MapPointCompact) =>
@@ -234,153 +249,280 @@ export const MapView: React.FC<MapViewProps> = ({
   }, [selectedDetail])
 
   // Renderização de 22.282 pontos no <canvas> 2D a 60 FPS
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+  const drawCanvas = useCallback(
+    (now: number = performance.now()) => {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
 
-    const dpr = window.devicePixelRatio || 1
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.clearRect(0, 0, viewportSize.w, viewportSize.h)
+      const dpr = window.devicePixelRatio || 1
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, viewportSize.w, viewportSize.h)
 
-    // 1. Regiões dos Clusters
-    for (const c of activeClusters) {
-      const sx = toScreenX(c.cx)
-      const sy = toScreenY(c.cy)
-      const rPx = c.radius * zoom
-      if (sx + rPx < -60 || sx - rPx > viewportSize.w + 60 || sy + rPx < -60 || sy - rPx > viewportSize.h + 60) {
-        continue
-      }
-      const isActive = selectedClusterId === c.clusterId
-      ctx.beginPath()
-      ctx.arc(sx, sy, rPx, 0, Math.PI * 2)
-      ctx.fillStyle = isActive ? 'rgba(244,244,246,0.035)' : 'rgba(244,244,246,0.012)'
-      ctx.fill()
-      ctx.lineWidth = isActive ? 1.5 : 1
-      ctx.strokeStyle = isActive ? 'rgba(244,244,246,0.28)' : 'rgba(255,255,255,0.06)'
-      ctx.stroke()
-    }
-
-    // 2. Manchas Vazias (Void Gap Zones) na projeção semântica
-    if (projection === 'semantic') {
-      ctx.save()
-      ctx.setLineDash([4, 4])
-      for (const vz of mapData.voidZones) {
-        const sx = toScreenX(vz.x)
-        const sy = toScreenY(vz.y)
-        const rPx = vz.radius * zoom
-        const isSel = selectedVoidId === vz.id
+      // 1. Regiões dos Clusters
+      for (const c of activeClusters) {
+        const sx = toScreenX(c.cx)
+        const sy = toScreenY(c.cy)
+        const rPx = c.radius * zoom
+        if (sx + rPx < -60 || sx - rPx > viewportSize.w + 60 || sy + rPx < -60 || sy - rPx > viewportSize.h + 60) {
+          continue
+        }
+        const isActive = selectedClusterId === c.clusterId
         ctx.beginPath()
         ctx.arc(sx, sy, rPx, 0, Math.PI * 2)
-        ctx.fillStyle = isSel ? 'rgba(229,169,60,0.06)' : 'rgba(5,5,7,0.72)'
+        ctx.fillStyle = isActive ? 'rgba(244,244,246,0.035)' : 'rgba(244,244,246,0.012)'
         ctx.fill()
-        ctx.lineWidth = isSel ? 1.5 : 1
-        ctx.strokeStyle = isSel ? 'rgba(229,169,60,0.7)' : 'rgba(255,255,255,0.16)'
+        ctx.lineWidth = isActive ? 1.5 : 1
+        ctx.strokeStyle = isActive ? 'rgba(244,244,246,0.28)' : 'rgba(255,255,255,0.06)'
         ctx.stroke()
       }
-      ctx.restore()
-    }
 
-    // 3. Pontos em lotes rápidos por camada (normal / dimmed / Tier S)
-    const dotR = Math.max(1.3, Math.min(4.2, zoom * 6.5))
-    const dotRS = Math.max(2.1, Math.min(5.2, zoom * 8.2))
-    const selectedId = selectedDetail?.item.id || null
-
-    // Dimmed points
-    ctx.fillStyle = 'rgba(113,113,122,0.18)'
-    ctx.beginPath()
-    for (const p of points) {
-      const { x, y, cid } = getPointCoords(p)
-      const sx = toScreenX(x)
-      const sy = toScreenY(y)
-      if (sx < -6 || sx > viewportSize.w + 6 || sy < -6 || sy > viewportSize.h + 6) continue
-      const isMatched = !matchingIdSet || matchingIdSet.has(p.id)
-      const clusterOk = selectedClusterId === null || selectedClusterId === cid
-      if (!isMatched || !clusterOk) {
-        ctx.moveTo(sx + dotR, sy)
-        ctx.arc(sx, sy, dotR, 0, Math.PI * 2)
-      }
-    }
-    ctx.fill()
-
-    // Active non-S points
-    ctx.fillStyle = 'rgba(161,161,170,0.68)'
-    ctx.beginPath()
-    for (const p of points) {
-      if (p.tier === 'S' || p.id === selectedId || neighborIdSet.has(p.id)) continue
-      const { x, y, cid } = getPointCoords(p)
-      const sx = toScreenX(x)
-      const sy = toScreenY(y)
-      if (sx < -6 || sx > viewportSize.w + 6 || sy < -6 || sy > viewportSize.h + 6) continue
-      const isMatched = !matchingIdSet || matchingIdSet.has(p.id)
-      const clusterOk = selectedClusterId === null || selectedClusterId === cid
-      if (isMatched && clusterOk) {
-        ctx.moveTo(sx + dotR, sy)
-        ctx.arc(sx, sy, dotR, 0, Math.PI * 2)
-      }
-    }
-    ctx.fill()
-
-    // Active Tier S points (único acento cromático #e5a93c)
-    ctx.fillStyle = '#e5a93c'
-    ctx.beginPath()
-    for (const p of points) {
-      if (p.tier !== 'S' || p.id === selectedId || neighborIdSet.has(p.id)) continue
-      const { x, y, cid } = getPointCoords(p)
-      const sx = toScreenX(x)
-      const sy = toScreenY(y)
-      if (sx < -6 || sx > viewportSize.w + 6 || sy < -6 || sy > viewportSize.h + 6) continue
-      const isMatched = !matchingIdSet || matchingIdSet.has(p.id)
-      const clusterOk = selectedClusterId === null || selectedClusterId === cid
-      if (isMatched && clusterOk) {
-        ctx.moveTo(sx + dotRS, sy)
-        ctx.arc(sx, sy, dotRS, 0, Math.PI * 2)
-      }
-    }
-    ctx.fill()
-
-    // 4. Linhas para vizinhos do ponto selecionado
-    if (selectedDetail && selectedDetail.neighbors.length > 0) {
-      const selPt = points.find((p) => p.id === selectedDetail.item.id)
-      if (selPt) {
-        const sc = getPointCoords(selPt)
-        const ax = toScreenX(sc.x)
-        const ay = toScreenY(sc.y)
+      // 2. Manchas Vazias (Void Gap Zones) na projeção semântica
+      if (projection === 'semantic') {
         ctx.save()
-        ctx.strokeStyle = 'rgba(244,244,246,0.34)'
-        ctx.lineWidth = 1.2
-        ctx.setLineDash([3, 3])
-        ctx.beginPath()
-        for (const nb of selectedDetail.neighbors) {
-          const nbc =
-            projection === 'semantic'
-              ? { x: nb.item.x ?? 0, y: nb.item.y ?? 0 }
-              : { x: nb.item.structX ?? 0, y: nb.item.structY ?? 0 }
-          ctx.moveTo(ax, ay)
-          ctx.lineTo(toScreenX(nbc.x), toScreenY(nbc.y))
+        ctx.setLineDash([4, 4])
+        for (const vz of mapData.voidZones) {
+          const sx = toScreenX(vz.x)
+          const sy = toScreenY(vz.y)
+          const rPx = vz.radius * zoom
+          const isSel = selectedVoidId === vz.id
+          ctx.beginPath()
+          ctx.arc(sx, sy, rPx, 0, Math.PI * 2)
+          ctx.fillStyle = isSel ? 'rgba(232,184,75,0.08)' : 'rgba(5,5,7,0.72)'
+          ctx.fill()
+          ctx.lineWidth = isSel ? 1.5 : 1
+          ctx.strokeStyle = isSel ? 'rgba(232,184,75,0.75)' : 'rgba(232,184,75,0.26)'
+          ctx.stroke()
         }
-        ctx.stroke()
         ctx.restore()
       }
+
+      // 3. Pontos em lotes rápidos por camada (dimmed / B-D / Tier A / Tier S)
+      const dotR = Math.max(1.3, Math.min(4.2, zoom * 6.5))
+      const dotRA = Math.max(1.5, Math.min(4.5, zoom * 7.0))
+      const dotRS = Math.max(2.1, Math.min(5.2, zoom * 8.2))
+      const selectedId = selectedDetail?.item.id || null
+
+      // Dimmed points
+      ctx.fillStyle = 'rgba(113,113,122,0.18)'
+      ctx.beginPath()
+      for (const p of points) {
+        const { x, y, cid } = getPointCoords(p)
+        const sx = toScreenX(x)
+        const sy = toScreenY(y)
+        if (sx < -6 || sx > viewportSize.w + 6 || sy < -6 || sy > viewportSize.h + 6) continue
+        const isMatched = !matchingIdSet || matchingIdSet.has(p.id)
+        const clusterOk = selectedClusterId === null || selectedClusterId === cid
+        if (!isMatched || !clusterOk) {
+          ctx.moveTo(sx + dotR, sy)
+          ctx.arc(sx, sy, dotR, 0, Math.PI * 2)
+        }
+      }
+      ctx.fill()
+
+      // Active Tier B/C/D points
+      ctx.fillStyle = 'rgba(161,161,170,0.62)'
+      ctx.beginPath()
+      for (const p of points) {
+        if (p.tier === 'S' || p.tier === 'A' || p.id === selectedId || neighborIdSet.has(p.id)) continue
+        const { x, y, cid } = getPointCoords(p)
+        const sx = toScreenX(x)
+        const sy = toScreenY(y)
+        if (sx < -6 || sx > viewportSize.w + 6 || sy < -6 || sy > viewportSize.h + 6) continue
+        const isMatched = !matchingIdSet || matchingIdSet.has(p.id)
+        const clusterOk = selectedClusterId === null || selectedClusterId === cid
+        if (isMatched && clusterOk) {
+          ctx.moveTo(sx + dotR, sy)
+          ctx.arc(sx, sy, dotR, 0, Math.PI * 2)
+        }
+      }
+      ctx.fill()
+
+      // Active Tier A points (sutil acento violeta alinhado à paleta global)
+      ctx.fillStyle = 'rgba(168,85,247,0.58)'
+      ctx.beginPath()
+      for (const p of points) {
+        if (p.tier !== 'A' || p.id === selectedId || neighborIdSet.has(p.id)) continue
+        const { x, y, cid } = getPointCoords(p)
+        const sx = toScreenX(x)
+        const sy = toScreenY(y)
+        if (sx < -6 || sx > viewportSize.w + 6 || sy < -6 || sy > viewportSize.h + 6) continue
+        const isMatched = !matchingIdSet || matchingIdSet.has(p.id)
+        const clusterOk = selectedClusterId === null || selectedClusterId === cid
+        if (isMatched && clusterOk) {
+          ctx.moveTo(sx + dotRA, sy)
+          ctx.arc(sx, sy, dotRA, 0, Math.PI * 2)
+        }
+      }
+      ctx.fill()
+
+      // Active Tier S points (acento dourado global #e8b84b)
+      ctx.fillStyle = TIER_COLOR_META.S.hex
+      ctx.beginPath()
+      for (const p of points) {
+        if (p.tier !== 'S' || p.id === selectedId || neighborIdSet.has(p.id)) continue
+        const { x, y, cid } = getPointCoords(p)
+        const sx = toScreenX(x)
+        const sy = toScreenY(y)
+        if (sx < -6 || sx > viewportSize.w + 6 || sy < -6 || sy > viewportSize.h + 6) continue
+        const isMatched = !matchingIdSet || matchingIdSet.has(p.id)
+        const clusterOk = selectedClusterId === null || selectedClusterId === cid
+        if (isMatched && clusterOk) {
+          ctx.moveTo(sx + dotRS, sy)
+          ctx.arc(sx, sy, dotRS, 0, Math.PI * 2)
+        }
+      }
+      ctx.fill()
+
+      // 3b. Pulso dourado em anéis expansivos nos pontos Tier S do cluster selecionado
+      const pulse = pulseStateRef.current
+      if (pulse && pulse.clusterId === selectedClusterId) {
+        const elapsed = Math.max(0, now - pulse.startTime)
+        const progress = Math.min(1, elapsed / PULSE_DURATION_MS)
+        if (progress < 1) {
+          const pulseCoords: Array<[number, number]> = []
+          for (const p of points) {
+            if (p.tier !== 'S') continue
+            const { x, y, cid } = getPointCoords(p)
+            if (cid !== pulse.clusterId) continue
+            if (matchingIdSet && !matchingIdSet.has(p.id)) continue
+            const sx = toScreenX(x)
+            const sy = toScreenY(y)
+            if (sx < -32 || sx > viewportSize.w + 32 || sy < -32 || sy > viewportSize.h + 32) continue
+            pulseCoords.push([sx, sy])
+          }
+
+          if (pulseCoords.length > 0) {
+            const rings = [
+              {
+                radius: dotRS + 3 + (1 - Math.pow(1 - progress, 3)) * 18,
+                alpha: (1 - progress) * 0.85,
+                lineWidth: Math.max(1, 1.8 * (1 - progress * 0.5)),
+              },
+            ]
+            if (progress > 0.18) {
+              const subProgress = (progress - 0.18) / 0.82
+              rings.push({
+                radius: dotRS + 2 + (1 - Math.pow(1 - subProgress, 3)) * 14,
+                alpha: (1 - subProgress) * 0.45,
+                lineWidth: 1,
+              })
+            }
+
+            ctx.save()
+            for (const ring of rings) {
+              ctx.strokeStyle = `rgba(232, 184, 75, ${ring.alpha.toFixed(3)})`
+              ctx.lineWidth = ring.lineWidth
+              ctx.beginPath()
+              for (const [sx, sy] of pulseCoords) {
+                ctx.moveTo(sx + ring.radius, sy)
+                ctx.arc(sx, sy, ring.radius, 0, Math.PI * 2)
+              }
+              ctx.stroke()
+            }
+            ctx.restore()
+          }
+        }
+      }
+
+      // 4. Linhas para vizinhos do ponto selecionado
+      if (selectedDetail && selectedDetail.neighbors.length > 0) {
+        const selPt = points.find((p) => p.id === selectedDetail.item.id)
+        if (selPt) {
+          const sc = getPointCoords(selPt)
+          const ax = toScreenX(sc.x)
+          const ay = toScreenY(sc.y)
+          ctx.save()
+          ctx.strokeStyle = 'rgba(244,244,246,0.34)'
+          ctx.lineWidth = 1.2
+          ctx.setLineDash([3, 3])
+          ctx.beginPath()
+          for (const nb of selectedDetail.neighbors) {
+            const nbc =
+              projection === 'semantic'
+                ? { x: nb.item.x ?? 0, y: nb.item.y ?? 0 }
+                : { x: nb.item.structX ?? 0, y: nb.item.structY ?? 0 }
+            ctx.moveTo(ax, ay)
+            ctx.lineTo(toScreenX(nbc.x), toScreenY(nbc.y))
+          }
+          ctx.stroke()
+          ctx.restore()
+        }
+      }
+    },
+    [
+      points,
+      activeClusters,
+      mapData.voidZones,
+      projection,
+      viewportSize,
+      zoom,
+      toScreenX,
+      toScreenY,
+      getPointCoords,
+      matchingIdSet,
+      selectedClusterId,
+      selectedVoidId,
+      selectedDetail,
+      neighborIdSet,
+    ]
+  )
+
+  drawCanvasRef.current = drawCanvas
+
+  useEffect(() => {
+    if (pulseRafRef.current !== null) {
+      cancelAnimationFrame(pulseRafRef.current)
+      pulseRafRef.current = null
     }
-  }, [
-    points,
-    activeClusters,
-    mapData.voidZones,
-    projection,
-    viewportSize,
-    pan,
-    zoom,
-    toScreenX,
-    toScreenY,
-    getPointCoords,
-    matchingIdSet,
-    selectedClusterId,
-    selectedVoidId,
-    selectedDetail,
-    neighborIdSet,
-  ])
+    if (selectedClusterId === null) {
+      pulseStateRef.current = null
+      return
+    }
+    const prefersReducedMotion =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (prefersReducedMotion) {
+      pulseStateRef.current = null
+      return
+    }
+
+    const startTime = performance.now()
+    pulseStateRef.current = { clusterId: selectedClusterId, startTime }
+
+    const tick = (now: number) => {
+      const pulse = pulseStateRef.current
+      if (!pulse || pulse.clusterId !== selectedClusterId) {
+        pulseRafRef.current = null
+        return
+      }
+      const elapsed = now - pulse.startTime
+      if (elapsed >= PULSE_DURATION_MS) {
+        pulseStateRef.current = null
+        pulseRafRef.current = null
+        drawCanvasRef.current(now)
+        return
+      }
+      drawCanvasRef.current(now)
+      pulseRafRef.current = requestAnimationFrame(tick)
+    }
+
+    pulseRafRef.current = requestAnimationFrame(tick)
+
+    return () => {
+      if (pulseRafRef.current !== null) {
+        cancelAnimationFrame(pulseRafRef.current)
+        pulseRafRef.current = null
+      }
+      pulseStateRef.current = null
+    }
+  }, [selectedClusterId])
+
+  useEffect(() => {
+    drawCanvas(performance.now())
+  }, [drawCanvas])
 
   // LOD 3: Overlay de miniaturas apenas em zoom alto (>= 0.85) ou para ponto selecionado + vizinhos
   const floatingThumbNodes = useMemo(() => {
@@ -517,7 +659,7 @@ export const MapView: React.FC<MapViewProps> = ({
   }
 
   return (
-    <div className="flex h-[calc(100dvh-57px)] flex-col overflow-hidden lg:h-dvh">
+    <div className="flex min-h-[calc(100dvh-57px)] flex-col lg:h-dvh lg:overflow-hidden">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.07] bg-[#0b0b0e] px-4 py-3">
         <div className="flex flex-wrap items-center gap-3">
           <div>
@@ -529,7 +671,7 @@ export const MapView: React.FC<MapViewProps> = ({
             </h1>
           </div>
 
-          <div className="inline-flex rounded-xl border border-white/[0.08] bg-[#09090b] p-0.5">
+          <div className="inline-flex gap-0.5 rounded-xl border border-white/[0.08] bg-[#09090b] p-0.5">
             {(
               [
                 { id: 'semantic', label: 'Semântica' },
@@ -539,17 +681,13 @@ export const MapView: React.FC<MapViewProps> = ({
               <button
                 key={opt.id}
                 type="button"
+                data-active={projection === opt.id}
                 onClick={() => {
                   setProjection(opt.id)
                   setSelectedClusterId(null)
                   setSelectedVoidId(null)
                 }}
-                className={[
-                  'rounded-lg px-2.5 py-1 text-[11px] transition-colors cursor-pointer',
-                  projection === opt.id
-                    ? 'bg-[#1a1a20] font-medium text-zinc-100'
-                    : 'text-zinc-500 hover:text-zinc-300',
-                ].join(' ')}
+                className="btn-ghost min-h-[28px] rounded-lg px-2.5 py-1 text-[11px]"
               >
                 {opt.label}
               </button>
@@ -571,15 +709,14 @@ export const MapView: React.FC<MapViewProps> = ({
                 <button
                   key={f.id}
                   type="button"
+                  data-active={active}
                   onClick={() => setQuickFilter(f.id)}
                   className={[
-                    'rounded-lg border px-2 py-1 text-[11px] transition-colors cursor-pointer',
-                    active
-                      ? isS
-                        ? 'border-[#e5a93c]/60 bg-[#e5a93c]/10 text-[#e5a93c]'
-                        : 'border-white/25 bg-white/[0.06] text-zinc-100'
-                      : 'border-white/[0.07] bg-[#0f0f13] text-zinc-400 hover:border-white/[0.16]',
-                  ].join(' ')}
+                    'btn-ghost min-h-[28px] rounded-lg px-2 py-1 text-[11px]',
+                    active && isS ? TIER_COLOR_META.S.badgeClass : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
                 >
                   {f.label}
                 </button>
@@ -603,10 +740,10 @@ export const MapView: React.FC<MapViewProps> = ({
           <button
             type="button"
             onClick={() => fitMapToViewport(activeClusters)}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-white/[0.08] bg-[#111115] px-2.5 py-1.5 text-[11px] text-zinc-300 hover:border-white/[0.18] cursor-pointer"
+            className="btn-secondary min-h-[32px] px-2.5 text-[11px]"
           >
             <RotateCcw className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Enquadrar</span>
+            <span className="hidden sm:inline">Enquadrar mapa</span>
           </button>
         </div>
       </header>
@@ -618,7 +755,7 @@ export const MapView: React.FC<MapViewProps> = ({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerLeave={() => setHoveredPoint(null)}
-          className="relative flex-1 overflow-hidden bg-[#08080a] select-none cursor-grab active:cursor-grabbing"
+          className="relative min-h-[360px] flex-1 overflow-hidden bg-[#08080a] select-none cursor-grab active:cursor-grabbing lg:min-h-0"
         >
           <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 h-full w-full" />
 
@@ -647,9 +784,11 @@ export const MapView: React.FC<MapViewProps> = ({
             )
           })}
 
-          {/* Rótulos das Manchas Vazias */}
+          {/* Pins Territoriais das Manchas Vazias (visíveis em zoom ≥ 0.22 ou quando selecionado) */}
           {projection === 'semantic'
             ? mapData.voidZones.map((vz) => {
+                const isSelected = selectedVoidId === vz.id
+                if (zoom < 0.22 && !isSelected) return null
                 const sx = toScreenX(vz.x)
                 const sy = toScreenY(vz.y)
                 if (sx < -60 || sx > viewportSize.w + 60 || sy < -60 || sy > viewportSize.h + 60) return null
@@ -658,6 +797,7 @@ export const MapView: React.FC<MapViewProps> = ({
                     key={`vz-${vz.id}`}
                     type="button"
                     data-map-interactive="true"
+                    title={`${vz.label} · ${formatTagPt(vz.tagA)} × ${formatTagPt(vz.tagB)}`}
                     onClick={() => {
                       setSelectedVoidId(vz.id)
                       setSelectedDetail(null)
@@ -665,9 +805,17 @@ export const MapView: React.FC<MapViewProps> = ({
                       flyTo(vz.x, vz.y, Math.max(0.55, zoom))
                     }}
                     style={{ left: sx, top: sy }}
-                    className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-dashed border-white/[0.14] bg-[#070709]/85 px-2 py-0.5 font-mono text-[9px] text-zinc-400 hover:border-[#e5a93c]/60 cursor-pointer"
+                    className={[
+                      'press-scale absolute -translate-x-1/2 -translate-y-1/2 inline-flex items-center gap-1.5 rounded-full border border-dashed px-2.5 py-0.5 font-mono text-[9px] font-medium tracking-wide transition-colors cursor-pointer backdrop-blur-xs',
+                      isSelected
+                        ? 'z-20 border-[#e8b84b] bg-[#e8b84b]/18 text-[#f7da8a] shadow-[0_0_16px_-3px_rgba(232,184,75,0.45)]'
+                        : 'border-[#e8b84b]/55 bg-[#09090c]/90 text-[#e8b84b] hover:border-[#e8b84b] hover:bg-[#e8b84b]/10',
+                    ].join(' ')}
                   >
-                    GAP · O=0
+                    <span className="relative flex h-2 w-2 shrink-0 items-center justify-center">
+                      <span className="h-1.5 w-1.5 rounded-full bg-[#e8b84b]" />
+                    </span>
+                    <span>GAP · E={vz.expectedCount}</span>
                   </button>
                 )
               })
@@ -687,17 +835,16 @@ export const MapView: React.FC<MapViewProps> = ({
                 className={[
                   'absolute overflow-hidden rounded-lg border bg-[#101013] cursor-pointer',
                   node.kind === 'selected'
-                    ? 'z-30 border-white ring-2 ring-white/25'
+                    ? 'z-30 border-white ring-1 ring-white/40'
                     : node.kind === 'neighbor'
                       ? 'z-20 border-zinc-300'
                       : 'z-10 border-white/20 hover:z-20',
                 ].join(' ')}
               >
-                <img
+                <PromptThumb
                   src={`/api/thumbnail/${node.sourceLib}/${node.id}`}
                   alt={node.title}
-                  loading="lazy"
-                  className="h-full w-full object-cover"
+                  fallbackLabel="·"
                 />
               </button>
             )
@@ -712,13 +859,18 @@ export const MapView: React.FC<MapViewProps> = ({
               }}
               className="pointer-events-none absolute z-40 w-56 rounded-xl border border-white/[0.12] bg-[#0c0c10]/95 p-2.5 shadow-xl"
             >
-              <div className="flex items-center justify-between font-mono text-[10px]">
-                <span className={hoveredPoint.pt.tier === 'S' ? 'text-[#e5a93c]' : 'text-zinc-300'}>
+              <div className="flex items-center justify-between gap-2 font-mono text-[10px]">
+                <span
+                  className={[
+                    'tabular-mono rounded-full border px-1.5 py-0.5 text-[9px] font-medium',
+                    TIER_COLOR_META[hoveredPoint.pt.tier].badgeClass,
+                  ].join(' ')}
+                >
                   TIER {hoveredPoint.pt.tier} · P{hoveredPoint.pt.percentile}
                 </span>
                 <span className="text-zinc-500">MAT {Math.round(hoveredPoint.pt.maturity)}</span>
               </div>
-              <div className="mt-1 truncate text-[11px] font-medium text-zinc-100">
+              <div className="mt-1.5 truncate text-[11px] font-medium text-zinc-100">
                 {hoveredPoint.pt.title}
               </div>
               <div className="truncate text-[10px] text-zinc-500">
@@ -732,6 +884,21 @@ export const MapView: React.FC<MapViewProps> = ({
               <span className="tabular-mono rounded-xl border border-white/10 bg-[#0b0b0e] px-3 py-1.5 text-[11px] text-zinc-300">
                 Carregando nuvem de pontos...
               </span>
+            </div>
+          ) : pointsError ? (
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/65 p-4">
+              <div className="flex max-w-sm flex-col items-center gap-2.5 rounded-2xl border border-white/15 bg-[#0c0c10] p-4 text-center">
+                <span className="section-eyebrow">Erro ao carregar mapa</span>
+                <p className="font-mono text-[11px] text-zinc-300">{pointsError}</p>
+                <button
+                  type="button"
+                  onClick={() => setReloadPointsNonce((n) => n + 1)}
+                  className="btn-secondary text-[11px]"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  <span>Tentar novamente</span>
+                </button>
+              </div>
             </div>
           ) : null}
 
@@ -759,12 +926,22 @@ export const MapView: React.FC<MapViewProps> = ({
               <ZoomIn className="h-3.5 w-3.5" />
             </button>
             <span className="mx-1 h-3 w-px bg-white/10" />
-            <span className="inline-flex items-center gap-1.5 text-[10px] text-zinc-400">
-              <span className="h-2 w-2 rounded-full bg-[#e5a93c]" />
+            <span className="inline-flex items-center gap-1.5 text-[10px] text-zinc-300">
+              <span
+                className="h-2 w-2 rounded-full"
+                style={{ backgroundColor: TIER_COLOR_META.S.hex }}
+              />
               Tier S
             </span>
-            <span className="inline-flex items-center gap-1.5 text-[10px] text-zinc-500">
-              <span className="h-2 w-2 rounded-full border border-dashed border-white/40" />
+            <span className="inline-flex items-center gap-1.5 text-[10px] text-purple-300/80">
+              <span
+                className="h-2 w-2 rounded-full opacity-80"
+                style={{ backgroundColor: TIER_COLOR_META.A.hex }}
+              />
+              Tier A
+            </span>
+            <span className="inline-flex items-center gap-1.5 text-[10px] text-[#e8b84b]/80">
+              <span className="h-2 w-2 rounded-full border border-dashed border-[#e8b84b]/80" />
               Gap (O=0)
             </span>
           </div>
@@ -783,15 +960,18 @@ export const MapView: React.FC<MapViewProps> = ({
                   <div className="flex items-center gap-2">
                     <span
                       className={[
-                        'tabular-mono rounded-full border px-2 py-0.5 text-[10px]',
-                        selectedDetail.item.rarity.tier === 'S'
-                          ? 'border-[#e5a93c]/60 text-[#e5a93c]'
-                          : 'border-white/10 text-zinc-300',
+                        'tabular-mono rounded-full border px-2 py-0.5 text-[10px] font-medium',
+                        TIER_COLOR_META[selectedDetail.item.rarity.tier].badgeClass,
                       ].join(' ')}
                     >
                       TIER {selectedDetail.item.rarity.tier}
                     </span>
-                    <span className="tabular-mono text-[11px] text-zinc-400">
+                    <span
+                      className={[
+                        'tabular-mono text-[11px]',
+                        TIER_COLOR_META[selectedDetail.item.rarity.tier].textClass,
+                      ].join(' ')}
+                    >
                       {selectedDetail.item.rarity.label}
                     </span>
                   </div>
@@ -804,11 +984,13 @@ export const MapView: React.FC<MapViewProps> = ({
                   </p>
                 </div>
                 {selectedDetail.item.thumbnailUrl ? (
-                  <img
-                    src={selectedDetail.item.thumbnailUrl}
-                    alt={selectedDetail.item.title}
-                    className="h-16 w-14 shrink-0 rounded-xl border border-white/10 object-cover"
-                  />
+                  <div className="h-16 w-14 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-[#121217]">
+                    <PromptThumb
+                      src={selectedDetail.item.thumbnailUrl}
+                      alt={selectedDetail.item.title}
+                      fallbackLabel="Sem img"
+                    />
+                  </div>
                 ) : null}
               </div>
 
@@ -819,10 +1001,10 @@ export const MapView: React.FC<MapViewProps> = ({
               <button
                 type="button"
                 onClick={() => onInspectItem(selectedDetail.item)}
-                className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/[0.12] bg-[#15151a] py-2 text-[12px] font-medium text-zinc-100 hover:border-white/25 cursor-pointer"
+                className="btn-primary w-full text-[12px]"
               >
                 <Maximize2 className="h-3.5 w-3.5" />
-                <span>Inspecionar 8 Atributos</span>
+                <span>Inspecionar 8 atributos</span>
               </button>
 
               <div className="space-y-2 border-t border-white/[0.07] pt-3">
@@ -839,11 +1021,13 @@ export const MapView: React.FC<MapViewProps> = ({
                         className="flex min-w-0 flex-1 items-center gap-2.5 text-left cursor-pointer"
                       >
                         {nb.item.thumbnailUrl ? (
-                          <img
-                            src={nb.item.thumbnailUrl}
-                            alt={nb.item.title}
-                            className="h-10 w-9 shrink-0 rounded-lg object-cover"
-                          />
+                          <div className="h-10 w-9 shrink-0 overflow-hidden rounded-lg bg-[#121217]">
+                            <PromptThumb
+                              src={nb.item.thumbnailUrl}
+                              alt={nb.item.title}
+                              fallbackLabel="·"
+                            />
+                          </div>
                         ) : null}
                         <div className="min-w-0">
                           <div className="truncate text-[11px] font-medium text-zinc-200">
@@ -857,9 +1041,9 @@ export const MapView: React.FC<MapViewProps> = ({
                       <button
                         type="button"
                         onClick={() => onOpenPair(selectedDetail.item.id, nb.item.id)}
-                        className="shrink-0 rounded-lg border border-white/[0.08] px-2 py-1 text-[10px] text-zinc-300 hover:border-white/20 cursor-pointer"
+                        className="btn-secondary min-h-[28px] shrink-0 rounded-lg px-2 py-1 text-[10px]"
                       >
-                        Comparar
+                        Comparar par
                       </button>
                     </div>
                   ))}
@@ -869,21 +1053,24 @@ export const MapView: React.FC<MapViewProps> = ({
           ) : selectedVoid ? (
             <div className="space-y-4">
               <div>
-                <span className="section-eyebrow">Mancha Vazia · Gap Estrutural</span>
+                <span className="section-eyebrow inline-flex items-center gap-1.5 text-[#e8b84b]">
+                  <MapPin className="h-3 w-3" />
+                  Mancha Vazia · Gap Estrutural
+                </span>
                 <h2 className="mt-1 text-[15px] font-medium text-zinc-100">{selectedVoid.label}</h2>
                 <p className="mt-1 text-[12px] text-zinc-400">
                   Cavidade entre Cluster {String(selectedVoid.betweenClusters[0]).padStart(2, '0')} e
                   Cluster {String(selectedVoid.betweenClusters[1]).padStart(2, '0')}.
                 </p>
               </div>
-              <div className="grid grid-cols-2 gap-2 rounded-xl border border-white/[0.07] bg-[#101014] p-3 font-mono text-[11px]">
+              <div className="grid grid-cols-2 gap-2 rounded-xl border border-dashed border-[#e8b84b]/35 bg-[#101014] p-3 font-mono text-[11px]">
                 <div>
                   <div className="text-zinc-500">Ocorrências</div>
                   <div className="text-zinc-100">0 (O = 0)</div>
                 </div>
                 <div>
                   <div className="text-zinc-500">Esperado (E)</div>
-                  <div className="text-[#e5a93c]">{selectedVoid.expectedCount}</div>
+                  <div className="text-[#e8b84b]">{selectedVoid.expectedCount}</div>
                 </div>
                 <div className="col-span-2 border-t border-white/[0.06] pt-2 text-[10px] text-zinc-400">
                   {formatTagPt(selectedVoid.tagA)} × {formatTagPt(selectedVoid.tagB)} ({selectedVoid.scopeLabel})
@@ -892,10 +1079,10 @@ export const MapView: React.FC<MapViewProps> = ({
               <button
                 type="button"
                 onClick={() => onOpenGap(selectedVoid.gapId)}
-                className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/[0.12] bg-[#15151a] py-2 text-[12px] font-medium text-zinc-100 hover:border-white/25 cursor-pointer"
+                className="btn-primary w-full text-[12px]"
               >
-                <span>Abrir na Matriz de Gaps</span>
-                <ArrowRight className="h-3.5 w-3.5" />
+                <Compass className="h-4 w-4" />
+                <span>Abrir na matriz de gaps</span>
               </button>
             </div>
           ) : (
@@ -956,15 +1143,24 @@ export const MapView: React.FC<MapViewProps> = ({
                         type="button"
                         onClick={() => {
                           setSelectedVoidId(vz.id)
+                          setSelectedDetail(null)
                           setSelectedClusterId(null)
                           flyTo(vz.x, vz.y, 0.62)
                         }}
-                        className="flex w-full items-center justify-between gap-2 rounded-xl border border-dashed border-white/[0.12] bg-[#09090b] px-3 py-2 text-left hover:border-white/25 cursor-pointer"
+                        className="press-scale flex w-full items-start justify-between gap-2.5 rounded-xl border border-dashed border-[#e8b84b]/35 bg-[#09090b] px-3 py-2 text-left transition-colors hover:border-[#e8b84b]/75 hover:bg-[#e8b84b]/[0.05] cursor-pointer"
                       >
-                        <span className="truncate font-mono text-[10px] text-zinc-300">
-                          {vz.label}
-                        </span>
-                        <span className="tabular-mono shrink-0 text-[10px] text-zinc-500">
+                        <div className="flex min-w-0 items-start gap-2">
+                          <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#e8b84b]" />
+                          <div className="min-w-0">
+                            <div className="truncate font-mono text-[10px] font-medium text-zinc-200">
+                              {vz.label}
+                            </div>
+                            <div className="mt-0.5 truncate text-[10px] text-zinc-400">
+                              {formatTagPt(vz.tagA)} × {formatTagPt(vz.tagB)}
+                            </div>
+                          </div>
+                        </div>
+                        <span className="tabular-mono shrink-0 rounded-md border border-[#e8b84b]/35 bg-[#e8b84b]/10 px-1.5 py-0.5 text-[10px] text-[#e8b84b]">
                           E={vz.expectedCount}
                         </span>
                       </button>

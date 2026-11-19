@@ -1,8 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react'
-import { ArrowLeftRight, Eye, EyeOff, Maximize2 } from 'lucide-react'
-import { computeTwoLayerSimilarity, diffPrompts } from '../core/promptDiff'
+import { ArrowLeftRight, Eye, EyeOff, Maximize2, Sparkles } from 'lucide-react'
+import { computeTwoLayerSimilarity, diffPrompts, type PromptDiffResult } from '../core/promptDiff'
+import { TIER_COLOR_META } from '../core/rarityEngine'
+import { PromptThumb } from './PromptThumb'
 import {
   ATTRIBUTE_META,
+  type AttributeKey,
+  type AttributeSlot,
+  type AttributeTagStat,
   type PairCategory,
   type PairsPayload,
   type PromptDetailResponse,
@@ -47,6 +52,151 @@ function collapseSharedSpans(spans: PromptDiffSpan[]): Array<{ text: string; typ
   return out
 }
 
+interface AttributeDiffRow {
+  meta: (typeof ATTRIBUTE_META)[number]
+  slotA: AttributeSlot
+  slotB: AttributeSlot
+  txtA: string
+  txtB: string
+  changed: boolean
+  attrDiff: PromptDiffResult
+}
+
+interface RarityDriverResult {
+  key: AttributeKey
+  label: string
+  shortLabel: string
+  rarerSide: 'A' | 'B'
+  delta: number
+  isEstimated: boolean
+}
+
+function scoreTagStats(stats: readonly AttributeTagStat[]): number {
+  let maxIdf = 0
+  let sumIdf = 0
+  for (const ts of stats) {
+    if (ts.idfWeight > maxIdf) maxIdf = ts.idfWeight
+    sumIdf += ts.idfWeight
+  }
+  return maxIdf + (sumIdf - maxIdf) * 0.25
+}
+
+function computeSlotRarityScore(
+  slot: AttributeSlot,
+  axisKey: AttributeKey,
+  item: PromptItem
+): { score: number; hasIdfData: boolean } {
+  if (slot.tagStats && slot.tagStats.length > 0) {
+    return {
+      score: scoreTagStats(slot.tagStats),
+      hasIdfData: true,
+    }
+  }
+
+  const rarestTags = item.rarity.rarestTags || []
+  if (rarestTags.length > 0) {
+    const slotTagSet = new Set((slot.tags || []).map((t) => t.toLowerCase()))
+    const matched = rarestTags.filter(
+      (rt) => rt.axis === axisKey || slotTagSet.has(rt.tag.toLowerCase())
+    )
+    if (matched.length > 0) {
+      return {
+        score: scoreTagStats(matched),
+        hasIdfData: true,
+      }
+    }
+  }
+
+  return { score: 0, hasIdfData: false }
+}
+
+function computeTopRarityDriver(
+  itemA: PromptItem,
+  itemB: PromptItem,
+  changedRows: AttributeDiffRow[]
+): RarityDriverResult | null {
+  if (changedRows.length === 0) return null
+
+  let best: RarityDriverResult | null = null
+
+  for (const row of changedRows) {
+    const idfA = computeSlotRarityScore(row.slotA, row.meta.key, itemA)
+    const idfB = computeSlotRarityScore(row.slotB, row.meta.key, itemB)
+    const lexicalDivergence = Math.max(0.05, 1 - row.attrDiff.similarityRatio)
+
+    let delta = 0
+    let rarerSide: 'A' | 'B' = 'A'
+    let isEstimated = false
+
+    if (idfA.hasIdfData || idfB.hasIdfData) {
+      delta = Math.abs(idfA.score - idfB.score)
+      rarerSide = idfA.score >= idfB.score ? 'A' : 'B'
+    } else {
+      isEstimated = true
+      const estA = row.slotA.filled
+        ? (itemA.rarity.percentile / 100) * (0.4 + 0.6 * lexicalDivergence)
+        : 0
+      const estB = row.slotB.filled
+        ? (itemB.rarity.percentile / 100) * (0.4 + 0.6 * lexicalDivergence)
+        : 0
+      delta = Math.abs(estA - estB)
+      rarerSide = estA >= estB ? 'A' : 'B'
+    }
+
+    if (!best || delta > best.delta) {
+      best = {
+        key: row.meta.key,
+        label: row.meta.label,
+        shortLabel: row.meta.shortLabel,
+        rarerSide,
+        delta,
+        isEstimated,
+      }
+    }
+  }
+
+  // Fallback quando os slots alterados empatam com delta 0 (ex.: mesmas tags ou mesmo percentil)
+  if (best && best.delta === 0) {
+    let fallbackRow = changedRows[0]
+    let maxDiv = -1
+    for (const row of changedRows) {
+      const div = 1 - row.attrDiff.similarityRatio + (row.slotA.filled !== row.slotB.filled ? 0.25 : 0)
+      if (div > maxDiv) {
+        maxDiv = div
+        fallbackRow = row
+      }
+    }
+    const lexicalDivergence = Math.max(0.05, 1 - fallbackRow.attrDiff.similarityRatio)
+    const tieRarerSide: 'A' | 'B' =
+      itemA.rarity.percentile !== itemB.rarity.percentile
+        ? itemA.rarity.percentile > itemB.rarity.percentile
+          ? 'A'
+          : 'B'
+        : itemA.rarity.score !== itemB.rarity.score
+          ? itemA.rarity.score > itemB.rarity.score
+            ? 'A'
+            : 'B'
+          : fallbackRow.slotA.filled !== fallbackRow.slotB.filled
+            ? fallbackRow.slotA.filled
+              ? 'A'
+              : 'B'
+            : fallbackRow.txtA.length >= fallbackRow.txtB.length
+              ? 'A'
+              : 'B'
+
+    return {
+      key: fallbackRow.meta.key,
+      label: fallbackRow.meta.label,
+      shortLabel: fallbackRow.meta.shortLabel,
+      rarerSide: tieRarerSide,
+      delta: Math.max(0.01, Number((lexicalDivergence * 0.25).toFixed(2))),
+      isEstimated: true,
+    }
+  }
+
+  return best
+}
+
 export const PairsView: React.FC<PairsViewProps> = ({
   items,
   pairsData,
@@ -56,6 +206,7 @@ export const PairsView: React.FC<PairsViewProps> = ({
 }) => {
   const [category, setCategory] = useState<PairCategory>('same_skeleton_diff_subject')
   const [onlyChanges, setOnlyChanges] = useState(true)
+  const [highlightRarityDriver, setHighlightRarityDriver] = useState(true)
   const [selectedPairId, setSelectedPairId] = useState<string | null>(null)
   const [hydratedExtras, setHydratedExtras] = useState<Record<string, PromptItem>>({})
   const [loadingCustomPair, setLoadingCustomPair] = useState(false)
@@ -157,15 +308,31 @@ export const PairsView: React.FC<PairsViewProps> = ({
     return diffPrompts(itemA.cleanPrompt, itemB.cleanPrompt)
   }, [itemA, itemB])
 
-  const visibleAttributes = useMemo(() => {
+  const attributeDiffRows = useMemo<AttributeDiffRow[]>(() => {
     if (!itemA || !itemB) return []
-    return ATTRIBUTE_META.filter((meta) => {
-      if (!onlyChanges) return true
-      const ta = itemA.attributes[meta.key].text.trim().toLowerCase()
-      const tb = itemB.attributes[meta.key].text.trim().toLowerCase()
-      return ta !== tb
+    return ATTRIBUTE_META.map((meta) => {
+      const slotA = itemA.attributes[meta.key]
+      const slotB = itemB.attributes[meta.key]
+      const txtA = slotA.text || '—'
+      const txtB = slotB.text || '—'
+      const changed = (slotA.text || '').trim().toLowerCase() !== (slotB.text || '').trim().toLowerCase()
+      const attrDiff = diffPrompts(txtA, txtB)
+      return { meta, slotA, slotB, txtA, txtB, changed, attrDiff }
     })
-  }, [itemA, itemB, onlyChanges])
+  }, [itemA, itemB])
+
+  const visibleAttributes = useMemo(() => {
+    return onlyChanges ? attributeDiffRows.filter((row) => row.changed) : attributeDiffRows
+  }, [attributeDiffRows, onlyChanges])
+
+  const topRarityDriver = useMemo(() => {
+    if (!itemA || !itemB) return null
+    return computeTopRarityDriver(
+      itemA,
+      itemB,
+      attributeDiffRows.filter((row) => row.changed)
+    )
+  }, [itemA, itemB, attributeDiffRows])
 
   return (
     <div className="mx-auto flex w-full max-w-[1640px] flex-col gap-5 p-4 sm:p-6">
@@ -180,19 +347,32 @@ export const PairsView: React.FC<PairsViewProps> = ({
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setOnlyChanges((v) => !v)}
-          className={[
-            'inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-[12px] transition-colors cursor-pointer',
-            onlyChanges
-              ? 'border-white/25 bg-[#16161c] text-zinc-100'
-              : 'border-white/[0.08] bg-[#101013] text-zinc-400 hover:text-zinc-200',
-          ].join(' ')}
-        >
-          {onlyChanges ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
-          <span>{onlyChanges ? 'Mostrando só o que mudou' : 'Mostrando prompt completo'}</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-active={highlightRarityDriver}
+            onClick={() => setHighlightRarityDriver((v) => !v)}
+            className={[
+              'btn-ghost text-[12px]',
+              highlightRarityDriver ? 'border-[#e8b84b]/55 bg-[#e8b84b]/10 text-[#e8b84b]' : '',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            <span>Destacar impacto na raridade</span>
+          </button>
+
+          <button
+            type="button"
+            data-active={onlyChanges}
+            onClick={() => setOnlyChanges((v) => !v)}
+            className="btn-secondary text-[12px]"
+          >
+            {onlyChanges ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+            <span>{onlyChanges ? 'Filtrar só alterações' : 'Exibir prompt completo'}</span>
+          </button>
+        </div>
       </header>
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
@@ -273,25 +453,21 @@ export const PairsView: React.FC<PairsViewProps> = ({
                 >
                   <div className="flex items-center gap-2">
                     {a.thumbnailUrl ? (
-                      <img
-                        src={a.thumbnailUrl}
-                        alt={a.title}
-                        loading="lazy"
-                        className="h-12 w-10 shrink-0 rounded-lg border border-white/[0.08] object-cover"
-                      />
+                      <div className="h-12 w-10 shrink-0 overflow-hidden rounded-lg border border-white/[0.08] bg-[#121217]">
+                        <PromptThumb src={a.thumbnailUrl} alt={a.title} fallbackLabel="·" />
+                      </div>
                     ) : null}
                     <ArrowLeftRight className="h-3.5 w-3.5 shrink-0 text-zinc-600" />
                     {b.thumbnailUrl ? (
-                      <img
-                        src={b.thumbnailUrl}
-                        alt={b.title}
-                        loading="lazy"
-                        className="h-12 w-10 shrink-0 rounded-lg border border-white/[0.08] object-cover"
-                      />
+                      <div className="h-12 w-10 shrink-0 overflow-hidden rounded-lg border border-white/[0.08] bg-[#121217]">
+                        <PromptThumb src={b.thumbnailUrl} alt={b.title} fallbackLabel="·" />
+                      </div>
                     ) : null}
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-[11px] font-medium text-zinc-200">
-                        {a.project} ↔ {b.project}
+                      <div className="flex items-center gap-1 truncate text-[11px] font-medium text-zinc-200">
+                        <span className="truncate">{a.project}</span>
+                        <ArrowLeftRight className="h-2.5 w-2.5 shrink-0 text-zinc-500" />
+                        <span className="truncate">{b.project}</span>
                       </div>
                       <div className="tabular-mono mt-0.5 text-[10px] text-zinc-400">
                         SEM {Math.round(pair.semanticSim * 100)}% · EST {Math.round(pair.structuralSim * 100)}%
@@ -319,9 +495,18 @@ export const PairsView: React.FC<PairsViewProps> = ({
             <>
               {/* Cabeçalho do par com métricas */}
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.07] pb-3">
-                <div>
+                <div className="min-w-0">
                   <span className="section-eyebrow">Comparação Direta</span>
                   <p className="mt-1 text-[12px] text-zinc-300">{currentPair.reason}</p>
+                  {highlightRarityDriver && topRarityDriver ? (
+                    <div className="mt-2 inline-flex flex-wrap items-center gap-1.5 rounded-lg border border-[#e8b84b]/50 bg-[#e8b84b]/10 px-2.5 py-1 font-mono text-[10px] text-[#e8b84b]">
+                      <Sparkles className="h-3 w-3 shrink-0" />
+                      <span>Maior impacto na raridade: {topRarityDriver.label}</span>
+                      <span className="text-[#f3d078]/85">
+                        · Prompt {topRarityDriver.rarerSide} (+{topRarityDriver.delta.toFixed(2)})
+                      </span>
+                    </div>
+                  ) : null}
                 </div>
                 <div className="flex items-center gap-2 font-mono text-[11px]">
                   <span className="rounded-lg border border-white/[0.08] bg-[#0b0b0e] px-2.5 py-1 text-zinc-300">
@@ -341,53 +526,52 @@ export const PairsView: React.FC<PairsViewProps> = ({
                 {[
                   { label: 'PROMPT A', item: itemA },
                   { label: 'PROMPT B', item: itemB },
-                ].map(({ label, item }) => (
-                  <div
-                    key={`${label}:${item.id}`}
-                    className="flex items-start gap-3 rounded-2xl border border-white/[0.07] bg-[#0b0b0e] p-3"
-                  >
-                    {item.thumbnailUrl ? (
-                      <img
-                        src={item.thumbnailUrl}
-                        alt={item.title}
-                        className="h-24 w-20 shrink-0 rounded-xl border border-white/[0.08] object-cover"
-                      />
-                    ) : null}
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="section-eyebrow">{label}</span>
-                        <span
-                          className={[
-                            'tabular-mono rounded-full border px-2 py-0.5 text-[10px]',
-                            item.rarity.tier === 'S'
-                              ? 'border-[#e5a93c]/60 text-[#e5a93c]'
-                              : 'border-white/10 text-zinc-300',
-                          ].join(' ')}
+                ].map(({ label, item }) => {
+                  const tierMeta = TIER_COLOR_META[item.rarity.tier]
+                  return (
+                    <div
+                      key={`${label}:${item.id}`}
+                      className="flex items-start gap-3 rounded-2xl border border-white/[0.07] bg-[#0b0b0e] p-3"
+                    >
+                      {item.thumbnailUrl ? (
+                        <div className="h-24 w-20 shrink-0 overflow-hidden rounded-xl border border-white/[0.08] bg-[#121217]">
+                          <PromptThumb src={item.thumbnailUrl} alt={item.title} fallbackLabel="Sem img" />
+                        </div>
+                      ) : null}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="section-eyebrow">{label}</span>
+                          <span
+                            className={[
+                              'tabular-mono rounded-full border px-2 py-0.5 text-[10px] font-medium',
+                              tierMeta.badgeClass,
+                            ].join(' ')}
+                          >
+                            TIER {item.rarity.tier}
+                          </span>
+                        </div>
+                        <h3 className="mt-1 truncate text-[13px] font-medium text-zinc-100">
+                          {item.title}
+                        </h3>
+                        <p className="truncate text-[11px] text-zinc-500">
+                          {item.project} · {item.attributes.estrutura.macroFormat.toUpperCase()} (
+                          {item.attributes.estrutura.kernelDialect})
+                        </p>
+                        <p className={['tabular-mono mt-1 text-[10px]', tierMeta.textClass].join(' ')}>
+                          {item.rarity.label}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => onInspectItem(item)}
+                          className="btn-ghost mt-2 min-h-[28px] px-2 text-[11px]"
                         >
-                          TIER {item.rarity.tier}
-                        </span>
+                          <Maximize2 className="h-3 w-3" />
+                          <span>Inspecionar atributos</span>
+                        </button>
                       </div>
-                      <h3 className="mt-1 truncate text-[13px] font-medium text-zinc-100">
-                        {item.title}
-                      </h3>
-                      <p className="truncate text-[11px] text-zinc-500">
-                        {item.project} · {item.attributes.estrutura.macroFormat.toUpperCase()} (
-                        {item.attributes.estrutura.kernelDialect})
-                      </p>
-                      <p className="tabular-mono mt-1 text-[10px] text-zinc-400">
-                        {item.rarity.label}
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => onInspectItem(item)}
-                        className="mt-2 inline-flex items-center gap-1 text-[11px] text-zinc-300 hover:text-white cursor-pointer"
-                      >
-                        <Maximize2 className="h-3 w-3" />
-                        <span>Abrir 8 atributos</span>
-                      </button>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
               </div>
 
               {/* Diff estruturado atributo a atributo (só o que mudou) */}
@@ -406,23 +590,44 @@ export const PairsView: React.FC<PairsViewProps> = ({
                     Os 8 atributos extraídos são idênticos entre A e B; veja o diff lexical abaixo.
                   </div>
                 ) : (
-                  <div className="space-y-2">
-                    {visibleAttributes.map((meta) => {
-                      const txtA = itemA.attributes[meta.key].text || '—'
-                      const txtB = itemB.attributes[meta.key].text || '—'
-                      const attrDiff = diffPrompts(txtA, txtB)
+                  <div key={`attr-diff-${currentPair.id}`} className="diff-span-enter space-y-2">
+                    {visibleAttributes.map(({ meta, attrDiff }) => {
                       const spansA = onlyChanges ? collapseSharedSpans(attrDiff.spansA) : attrDiff.spansA
                       const spansB = onlyChanges ? collapseSharedSpans(attrDiff.spansB) : attrDiff.spansB
+                      const isDriver = highlightRarityDriver && topRarityDriver?.key === meta.key
 
                       return (
                         <div
                           key={meta.key}
-                          className="rounded-xl border border-white/[0.07] bg-[#0b0b0e] p-3"
+                          className={[
+                            'rounded-xl border p-3 transition-colors',
+                            isDriver
+                              ? 'border-[#e8b84b]/65 bg-[#e8b84b]/[0.05]'
+                              : 'border-white/[0.07] bg-[#0b0b0e]',
+                          ].join(' ')}
                         >
-                          <div className="mb-2 flex items-center justify-between">
-                            <span className="tabular-mono text-[10px] font-medium uppercase tracking-wider text-zinc-400">
-                              {meta.shortLabel} · {meta.label}
-                            </span>
+                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span
+                                className={[
+                                  'tabular-mono text-[10px] font-medium uppercase tracking-wider',
+                                  isDriver ? 'text-[#e8b84b]' : 'text-zinc-400',
+                                ].join(' ')}
+                              >
+                                {meta.shortLabel} · {meta.label}
+                              </span>
+                              {isDriver && topRarityDriver ? (
+                                <>
+                                  <span className="tabular-mono inline-flex items-center gap-1 rounded-full border border-[#e8b84b]/60 bg-[#e8b84b]/15 px-2 py-0.5 text-[9px] font-medium uppercase tracking-wider text-[#e8b84b]">
+                                    <Sparkles className="h-2.5 w-2.5" />
+                                    MAIOR IMPACTO NA RARIDADE
+                                  </span>
+                                  <span className="tabular-mono rounded-full border border-[#e8b84b]/35 bg-[#e8b84b]/10 px-2 py-0.5 text-[9px] text-[#f3d078]">
+                                    Prompt {topRarityDriver.rarerSide} mais raro (+{topRarityDriver.delta.toFixed(2)})
+                                  </span>
+                                </>
+                              ) : null}
+                            </div>
                             <span className="tabular-mono text-[10px] text-zinc-600">
                               {Math.round(attrDiff.similarityRatio * 100)}% em comum
                             </span>
@@ -478,7 +683,7 @@ export const PairsView: React.FC<PairsViewProps> = ({
                       {cleanDiff.sharedTerms.length} termos compartilhados
                     </span>
                   </div>
-                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                  <div key={`clean-diff-${currentPair.id}`} className="diff-span-enter grid grid-cols-1 gap-3 md:grid-cols-2">
                     {[
                       onlyChanges ? collapseSharedSpans(cleanDiff.spansA) : cleanDiff.spansA,
                       onlyChanges ? collapseSharedSpans(cleanDiff.spansB) : cleanDiff.spansB,

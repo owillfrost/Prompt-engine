@@ -19,6 +19,7 @@ import {
 } from '../core/promptRefiner'
 import { QUADRANT_META } from '../core/rarityEngine'
 import { useCopyFeedback } from '../hooks/useCopyFeedback'
+import { PromptThumb } from './PromptThumb'
 import type {
   ImmatureQueueResponse,
   MatureMoldId,
@@ -326,12 +327,9 @@ export const RefinementStudioPanel: FC<RefinementStudioPanelProps> = ({
                     ].join(' ')}
                   >
                     {it.thumbnailUrl ? (
-                      <img
-                        src={it.thumbnailUrl}
-                        alt={it.title}
-                        loading="lazy"
-                        className="h-14 w-11 shrink-0 rounded-lg border border-white/[0.07] object-cover"
-                      />
+                      <div className="h-14 w-11 shrink-0 overflow-hidden rounded-lg border border-white/[0.07] bg-[#121217]">
+                        <PromptThumb src={it.thumbnailUrl} alt={it.title} fallbackLabel="·" />
+                      </div>
                     ) : null}
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
@@ -394,7 +392,7 @@ export const RefinementStudioPanel: FC<RefinementStudioPanelProps> = ({
         <section className="flex flex-col gap-4 rounded-2xl border border-white/[0.07] bg-[#101013] p-4 sm:p-5 lg:col-span-7">
           {!activeItem || !refinement ? (
             <div className="flex h-64 items-center justify-center text-[13px] text-zinc-500">
-              Selecione um prompt na Fila Raro + Imaturo ao lado.
+              Nenhum prompt selecionado.
             </div>
           ) : (
             <>
@@ -402,11 +400,9 @@ export const RefinementStudioPanel: FC<RefinementStudioPanelProps> = ({
               <div className="flex flex-wrap items-start justify-between gap-3 border-b border-white/[0.07] pb-3.5">
                 <div className="flex items-start gap-3">
                   {activeItem.thumbnailUrl ? (
-                    <img
-                      src={activeItem.thumbnailUrl}
-                      alt={activeItem.title}
-                      className="h-16 w-14 shrink-0 rounded-xl border border-white/[0.08] object-cover"
-                    />
+                    <div className="h-16 w-14 shrink-0 overflow-hidden rounded-xl border border-white/[0.08] bg-[#121217]">
+                      <PromptThumb src={activeItem.thumbnailUrl} alt={activeItem.title} fallbackLabel="Sem img" />
+                    </div>
                   ) : null}
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">

@@ -1,6 +1,8 @@
-import React from 'react'
-import { QUADRANT_META } from '../core/rarityEngine'
+import React, { useEffect, useRef, useState } from 'react'
+import { QUADRANT_META, TIER_COLOR_META } from '../core/rarityEngine'
+import { useAnimatedNumber } from '../hooks/useAnimatedNumber'
 import type { PromptItem } from '../types/promptEngine'
+import { PromptThumb } from './PromptThumb'
 
 interface PromptCollectionCardProps {
   item: PromptItem
@@ -14,14 +16,83 @@ const FORMAT_LABELS: Record<PromptItem['attributes']['estrutura']['macroFormat']
   single_paragraph: 'PARÁGRAFO',
 }
 
+const MAX_TILT_DEG = 3.5
+
+function canUse3DTilt(): boolean {
+  if (typeof window === 'undefined' || !window.matchMedia) return false
+  return (
+    window.matchMedia('(hover: hover) and (pointer: fine)').matches &&
+    !window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  )
+}
+
 export const PromptCollectionCard: React.FC<PromptCollectionCardProps> = ({
   item,
   selected,
   onSelect,
 }) => {
-  const isTopRarity = item.rarity.tier === 'S'
+  const cardRef = useRef<HTMLButtonElement | null>(null)
+  const [hasEnteredViewport, setHasEnteredViewport] = useState(false)
+
+  useEffect(() => {
+    if (hasEnteredViewport) return
+    const el = cardRef.current
+    if (!el) return
+    if (typeof IntersectionObserver === 'undefined') {
+      setHasEnteredViewport(true)
+      return
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setHasEnteredViewport(true)
+          observer.disconnect()
+        }
+      },
+      { threshold: 0.15 }
+    )
+
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [hasEnteredViewport])
+
+  const animatedPercentile = useAnimatedNumber(item.rarity.percentile, {
+    durationMs: 420,
+    decimals: 0,
+    enabled: hasEnteredViewport,
+  })
+
+  const tierMeta = TIER_COLOR_META[item.rarity.tier]
+  const isP99 = item.rarity.percentile >= 99
   const { estrutura } = item.attributes
   const quadMeta = QUADRANT_META[item.quadrant]
+
+  const roundedAnimatedPercentile = Math.round(animatedPercentile)
+  const displayRarityLabel =
+    roundedAnimatedPercentile === Math.round(item.rarity.percentile) && item.rarity.label
+      ? item.rarity.label
+      : `mais raro que ${roundedAnimatedPercentile}% da coleção`
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (e.pointerType === 'touch' || !canUse3DTilt()) return
+    const el = cardRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return
+
+    const nx = Math.max(-1, Math.min(1, ((e.clientX - rect.left) / rect.width) * 2 - 1))
+    const ny = Math.max(-1, Math.min(1, ((e.clientY - rect.top) / rect.height) * 2 - 1))
+    const rx = (-ny * MAX_TILT_DEG).toFixed(2)
+    const ry = (nx * MAX_TILT_DEG).toFixed(2)
+    el.style.transform = `perspective(800px) rotateX(${rx}deg) rotateY(${ry}deg) translateY(-2px)`
+  }
+
+  const handlePointerLeave = () => {
+    if (cardRef.current) {
+      cardRef.current.style.transform = ''
+    }
+  }
 
   const attrDots: Array<{ label: string; filled: boolean }> = [
     { label: 'SUJ', filled: item.attributes.sujeito.filled },
@@ -36,26 +107,27 @@ export const PromptCollectionCard: React.FC<PromptCollectionCardProps> = ({
 
   return (
     <button
+      ref={cardRef}
       type="button"
       onClick={() => onSelect(item)}
+      onPointerMove={handlePointerMove}
+      onPointerLeave={handlePointerLeave}
+      onPointerCancel={handlePointerLeave}
       className={[
-        'group flex flex-col overflow-hidden rounded-2xl border bg-[#101013] text-left transition-all duration-150 cursor-pointer',
-        selected
-          ? 'border-white/30 bg-[#141418]'
-          : isTopRarity
-            ? 'border-[#e5a93c]/35 hover:border-[#e5a93c]/65'
-            : 'border-white/[0.07] hover:border-white/[0.18]',
-      ].join(' ')}
+        'group card-3d-tilt flex flex-col overflow-hidden rounded-2xl border bg-[#101013] text-left cursor-pointer',
+        isP99 ? 'tier-s-aura' : '',
+        selected ? 'border-white/30 bg-[#141418]' : tierMeta.borderClass,
+      ]
+        .filter(Boolean)
+        .join(' ')}
     >
-      {/* Miniatura real — única fonte de cor na interface */}
+      {/* Miniatura real: única fonte de cor na interface */}
       <div className="relative aspect-[4/3] w-full overflow-hidden border-b border-white/[0.06] bg-[#0a0a0d]">
         {item.thumbnailUrl ? (
-          <img
+          <PromptThumb
             src={item.thumbnailUrl}
             alt={item.title}
-            loading="lazy"
-            decoding="async"
-            className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
+            fallbackLabel="Sem miniatura"
           />
         ) : (
           <div className="flex h-full w-full items-center justify-center text-[11px] text-zinc-600">
@@ -65,20 +137,30 @@ export const PromptCollectionCard: React.FC<PromptCollectionCardProps> = ({
 
         {/* Badges sóbrios sobrepostos apenas com fundo escuro neutro */}
         <div className="pointer-events-none absolute inset-x-2.5 top-2.5 flex items-center justify-between gap-2">
-          <span className="tabular-mono rounded-full border border-white/10 bg-black/75 px-2 py-0.5 text-[10px] text-zinc-300 backdrop-blur-sm">
+          <span className="tabular-mono min-w-0 truncate rounded-full border border-white/10 bg-black/75 px-2 py-0.5 text-[10px] text-zinc-300 backdrop-blur-sm">
             {FORMAT_LABELS[estrutura.macroFormat]} · {estrutura.kernelDialect}
           </span>
-          <span
-            className={[
-              'tabular-mono rounded-full border px-2 py-0.5 text-[10px] font-medium backdrop-blur-sm',
-              isTopRarity
-                ? 'border-[#e5a93c]/60 bg-black/85 text-[#e5a93c]'
-                : 'border-white/10 bg-black/75 text-zinc-300',
-            ].join(' ')}
-          >
-            TIER {item.rarity.tier}
+          <span className="inline-flex shrink-0 rounded-full bg-black/75 backdrop-blur-sm">
+            <span
+              className={[
+                'tabular-mono inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium',
+                tierMeta.badgeClass,
+              ].join(' ')}
+            >
+              {isP99 ? (
+                <span className="h-1.5 w-1.5 rounded-full bg-[#e8b84b]" aria-hidden="true" />
+              ) : null}
+              TIER {item.rarity.tier}
+            </span>
           </span>
         </div>
+
+        {isP99 ? (
+          <span className="pointer-events-none tabular-mono absolute right-2.5 bottom-2.5 inline-flex items-center gap-1 rounded-full border border-[#e8b84b]/60 bg-black/85 px-2 py-0.5 text-[9px] font-medium tracking-wider text-[#e8b84b] backdrop-blur-sm">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#e8b84b]" aria-hidden="true" />
+            TOP 0.1%
+          </span>
+        ) : null}
       </div>
 
       {/* Corpo denso */}
@@ -126,13 +208,8 @@ export const PromptCollectionCard: React.FC<PromptCollectionCardProps> = ({
 
           {/* Linha obrigatória de raridade em monoespaçada + maturidade */}
           <div className="flex items-center justify-between gap-2">
-            <span
-              className={[
-                'tabular-mono text-[11px]',
-                isTopRarity ? 'text-[#e5a93c]' : 'text-zinc-300',
-              ].join(' ')}
-            >
-              {item.rarity.label}
+            <span className={['tabular-mono text-[11px]', tierMeta.textClass].join(' ')}>
+              {displayRarityLabel}
             </span>
             <span className="tabular-mono shrink-0 text-[10px] text-zinc-500" title={quadMeta.description}>
               MAT {Math.round(item.maturity.score)}
