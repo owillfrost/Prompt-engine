@@ -97,7 +97,7 @@ export const SchemaProposalModal: React.FC<SchemaProposalModalProps> = ({
 
           {/* Tiers & Eixos */}
           <section className="space-y-2.5">
-            <span className="section-eyebrow">2. Eixos Raridade × Maturidade & Tiers S–D</span>
+            <span className="section-eyebrow">2. Eixos Raridade × Maturidade &amp; Tiers S a D</span>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
               {TIER_THRESHOLDS.map((t) => {
                 const isS = t.tier === 'S'
@@ -139,7 +139,7 @@ export const SchemaProposalModal: React.FC<SchemaProposalModalProps> = ({
               </span>
               <span className="tabular-mono text-[10px] text-zinc-500">
                 {stats?.primaryLibraryName ?? 'Google Flow + Prompts.library'} (N=
-                {stats?.totalCorpusSize?.toLocaleString('pt-BR') ?? '19.227'})
+                {stats?.totalCorpusSize?.toLocaleString('pt-BR') ?? '—'})
               </span>
             </div>
             <div className="rounded-xl border border-white/[0.07] bg-[#111116] p-3.5 text-[11px] leading-relaxed text-zinc-300">

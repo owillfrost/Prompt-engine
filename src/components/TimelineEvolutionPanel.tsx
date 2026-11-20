@@ -35,7 +35,7 @@ export const TimelineEvolutionPanel: FC<TimelineEvolutionPanelProps> = ({ onRefi
   if (loading && !data) {
     return (
       <div className="rounded-2xl border border-white/[0.07] bg-[#101013] p-10 text-center font-mono text-[12px] text-zinc-500">
-        Decodificando Base-36 timestamps e safras de 22.282 prompts...
+        Decodificando Base-36 timestamps e safras do acervo...
       </div>
     )
   }
@@ -145,9 +145,9 @@ export const TimelineEvolutionPanel: FC<TimelineEvolutionPanelProps> = ({ onRefi
         <section className="rounded-2xl border border-white/[0.07] bg-[#101013] p-4 sm:p-5">
           <div className="flex items-start justify-between gap-2 border-b border-white/[0.06] pb-3">
             <div>
-              <span className="section-eyebrow">Ingredientes Adormecidos (Jul–Ago → Out–Nov)</span>
+              <span className="section-eyebrow">Ingredientes Adormecidos (Jul/Ago para Out/Nov)</span>
               <p className="mt-0.5 text-[12px] text-zinc-400">
-                Tags que você dominava nas primeiras safras e reduziu bruscamente na fase recente — ótimas para reativar.
+                Tags que você dominava nas primeiras safras e reduziu bruscamente na fase recente, ótimas para reativar.
               </p>
             </div>
             <ArrowDownRight className="h-4 w-4 shrink-0 text-[#e5a93c]" />
@@ -190,7 +190,7 @@ export const TimelineEvolutionPanel: FC<TimelineEvolutionPanelProps> = ({ onRefi
         <section className="rounded-2xl border border-white/[0.07] bg-[#101013] p-4 sm:p-5">
           <div className="flex items-start justify-between gap-2 border-b border-white/[0.06] pb-3">
             <div>
-              <span className="section-eyebrow">Em Saturação Recente (Out–Nov/26)</span>
+              <span className="section-eyebrow">Em Saturação Recente (Out a Nov/26)</span>
               <p className="mt-0.5 text-[12px] text-zinc-400">
                 Ingredientes cujo uso cresceu fortemente nas safras recentes, puxando o acervo para padrões repetitivos.
               </p>

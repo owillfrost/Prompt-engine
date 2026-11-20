@@ -5,4 +5,7 @@ data/*.sqlite
 data/*.sqlite-wal
 data/*.sqlite-shm
 data/*.tmp
+data/*.next
 *.tsbuildinfo
+__pycache__/
+*.pyc

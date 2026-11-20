@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "ingest": "python scripts/ingest_google_flow.py"
+    "ingest": "python -u scripts/ingest_google_flow.py",
+    "sync": "python -u scripts/ingest_google_flow.py"
   },
   "dependencies": {
     "clsx": "^2.1.1",
