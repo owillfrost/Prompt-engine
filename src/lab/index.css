@@ -1,0 +1,190 @@
+@import "tailwindcss";
+@import "./globals.css";
+
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/fonts/geist-sans/Geist-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/fonts/geist-sans/Geist-LightItalic.woff2") format("woff2");
+  font-weight: 300;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/fonts/geist-sans/Geist-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/fonts/geist-sans/Geist-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Sans";
+  src: url("/fonts/geist-sans/Geist-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/geist-mono/GeistMono-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/geist-mono/GeistMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/geist-mono/GeistMono-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@theme {
+  --font-sans: "Geist Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* Escala tipográfica unificada (/lab) */
+  --text-2xs: 0.5625rem;
+  --text-eyebrow: 0.625rem;
+  --text-caption: 0.6875rem;
+  --text-xs: 0.75rem;
+  --text-dense: 0.8125rem;
+  --text-sm: 0.875rem;
+  --text-base: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 1.75rem;
+  --text-4xl: 2rem;
+
+  /* Apple Obsidian Dark Mode Semantic Tokens (SSoT) */
+  --color-canvas: #000000;
+  --color-surface: #0c0c0e;
+  --color-surface-hover: #151519;
+  --color-elevated: #1c1c22;
+  --color-border-subtle: #18181d;
+  --color-hairline: #26262f;
+  --color-border-hover: #3e3e4c;
+  --color-border-strong: #636374;
+  --color-ink: #f5f5f7;
+  --color-ink-secondary: #c7c7cc;
+  --color-ink-tertiary: #8e8e93;
+  --color-ink-muted: #787882;
+  --color-ink-dim: #48484e;
+  --color-brand: #684eff;
+  --color-brand-bright: #9b87ff;
+  --color-brand-2: #ff4f8b;
+  --color-tier-s: #ff4f8b;
+  --color-tier-s-bright: #ffc2d8;
+  --color-tier-a: #bf5af2;
+  --color-tier-b: #38a1ff;
+  --color-tier-c: #32d79b;
+  --color-tier-d: #8e8e93;
+  --color-success: #30d158;
+  --color-warning: #ff9f0a;
+  --color-danger: #ff453a;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    /* Aliases legados apontando para a SSoT de @theme */
+    --bg-canvas: var(--color-canvas);
+    --bg-surface: var(--color-surface);
+    --bg-surface-hover: var(--color-surface-hover);
+    --bg-elevated: var(--color-elevated);
+    --border-subtle: var(--color-border-subtle);
+    --border-hairline: var(--color-hairline);
+    --border-hover: var(--color-border-hover);
+    --border-strong: var(--color-border-strong);
+    --text-primary: var(--color-ink);
+    --text-secondary: var(--color-ink-secondary);
+    --text-tertiary: var(--color-ink-tertiary);
+    --text-muted: var(--color-ink-muted);
+    /* Paleta global de raridade (Tiers S-D) */
+    --tier-s: var(--color-tier-s);
+    --tier-a: var(--color-tier-a);
+    --tier-b: var(--color-tier-b);
+    --tier-c: var(--color-tier-c);
+    --tier-d: var(--color-tier-d);
+    --accent-rarity-top: var(--color-tier-s);
+    --danger: var(--color-danger);
+    --danger-subtle: color-mix(in srgb, var(--color-danger) 12%, transparent);
+    --lab-grid-gap: 1rem;
+    /* Motion SSoT */
+    --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+    --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+    --dur-press: 120ms;
+    --dur-fast: 160ms;
+    --dur-base: 200ms;
+    --dur-slow: 280ms;
+  }
+
+  :root[data-palette="nocturnal_violet"] {
+    --color-canvas: #0b0711;
+    --color-surface: #130c1e;
+    --color-surface-hover: #1a1028;
+    --color-elevated: #211532;
+    --color-border-subtle: #211532;
+    --color-hairline: #452d5b;
+    --color-border-hover: #743e63;
+    --color-border-strong: #c2939e;
+    --color-ink: #f5e1db;
+    --color-ink-secondary: #dfc4be;
+    --color-ink-tertiary: #c2939e;
+    --color-ink-muted: #8a7582;
+    --color-ink-dim: #565659;
+    --color-brand: #3c2a71;
+    --color-brand-bright: #c2939e;
+    --color-brand-2: #743e63;
+    --color-tier-s: #c2939e;
+    --color-tier-s-bright: #f5e1db;
+    --color-tier-a: #743e63;
+    --color-tier-b: #3c2a71;
+    --color-tier-c: #452d5b;
+    --color-tier-d: #565659;
+    --color-success: #c2939e;
+    --color-warning: #f5e1db;
+    --color-danger: #9e4768;
+  }
+
+  [data-density="compact"] {
+    --lab-grid-gap: 0.625rem;
+  }
+
+  dialog:modal {
+    overscroll-behavior: contain;
+  }
+
+  dialog::backdrop {
+    overflow: hidden;
+    overscroll-behavior: contain;
+  }
+}

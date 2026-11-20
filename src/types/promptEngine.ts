@@ -74,9 +74,9 @@ export const ATTRIBUTE_META: ReadonlyArray<{
   },
   {
     key: 'projeto_cliente',
-    label: 'Projeto / Cliente',
+    label: 'Pasta de Origem',
     shortLabel: 'PRJ',
-    description: 'Coleção, pasta Eagle, personagem/cliente ou biblioteca de origem.',
+    description: 'Pasta raiz de organização dos arquivos no acervo (metadado de localização, não comparativo).',
   },
   {
     key: 'estrutura',
@@ -318,9 +318,30 @@ export interface CooccurrenceMatrix2D {
   }>
 }
 
+export interface TestedBridgeItemThumb {
+  id: string
+  title: string
+  project: string
+  sourceLib: 'google_flow' | 'gemini_kimi'
+  thumbnailUrl: string | null
+  btime: number
+  rarityTier: RarityTier
+  rarityPercentile: number
+  maturityScore: number
+}
+
+export interface TestedGapBridgeSummary {
+  bridgeKey: string
+  tags: string[]
+  count: number
+  latestBtime: number
+  projects: string[]
+  items: TestedBridgeItemThumb[]
+}
+
 export interface GapRecord {
   id: string
-  kind: 'project_2d_zero' | 'global_3d_zero' | 'global_2d_low_lift'
+  kind: 'project_2d_zero' | 'global_3d_zero' | 'global_2d_low_lift' | 'global_frontier_zero'
   scope: string
   axisA: string
   tagA: string
@@ -335,8 +356,11 @@ export interface GapRecord {
   expectedCount: number
   lift: number
   isCoherent: boolean
+  isFrontier?: boolean
+  creativeCatalyst?: string
   donorAId: string | null
   donorBId: string | null
+  donorCId?: string | null
   title: string
   rationale: string
 }
@@ -345,7 +369,9 @@ export interface GapsPayload {
   matrices: CooccurrenceMatrix2D[]
   projectGaps: GapRecord[]
   globalTriadGaps: GapRecord[]
+  creativeFrontierGaps?: GapRecord[]
   globalUnderexplored: GapRecord[]
+  testedBridges?: TestedGapBridgeSummary[]
 }
 
 export interface ProjectSummaryRecord {
@@ -425,7 +451,15 @@ export interface SimilarityLayerScore {
 
 export type CoreContentAttributeKey = Exclude<AttributeKey, 'projeto_cliente' | 'estrutura'>
 
-export type GapAttributeSourceMode = 'donor_a' | 'donor_b' | 'gap_target'
+export type GapAttributeSourceMode = 'donor_a' | 'donor_b' | 'donor_c' | 'gap_target'
+
+export type GapMissionStage = 'copied' | 'forged' | 'tested'
+
+export interface GapMissionsStatusResponse {
+  drafts: GapDraftRecord[]
+  testedBridges: TestedGapBridgeSummary[]
+  totalTestedPrompts: number
+}
 
 export interface GapDonorsResponse {
   donorsA: PromptItem[]
@@ -448,6 +482,8 @@ export interface DecomposePreviewResponse {
 export interface GapDraftRecord {
   id: string
   createdAt: string
+  updatedAt?: string
+  status?: GapMissionStage
   gapId: string
   gapTitle: string
   scope: string
@@ -459,6 +495,7 @@ export interface GapDraftRecord {
   tagC?: string
   donorAId: string | null
   donorBId: string | null
+  donorCId?: string | null
   macroFormat: MacroFormat
   aspectRatio: string
   attributeSources: Record<CoreContentAttributeKey, GapAttributeSourceMode>
@@ -558,4 +595,56 @@ export interface TimelineInsightsResponse {
   dormantTags: TagDriftRecord[]
   saturatedTags: TagDriftRecord[]
   computationMs: number
+}
+
+export type ExperimentVariantMode = 'antithesis' | 'drift'
+
+export type ExperimentalSlotSource = 'donor_a' | 'donor_b' | 'donor_c'
+
+export interface AntipodeCandidateItem {
+  item: PromptItem
+  cosineSim: number
+  angularDeg: number
+}
+
+export interface AntithesisExperimentSample {
+  mode: 'antithesis'
+  poleA: PromptItem
+  antipodes: AntipodeCandidateItem[]
+  poleAPool: PromptItem[]
+}
+
+export interface DriftExperimentSample {
+  mode: 'drift'
+  donorA: PromptItem
+  donorB: PromptItem
+  donorC: PromptItem | null
+  poolA: PromptItem[]
+  poolB: PromptItem[]
+}
+
+export type ExperimentSampleResponse = AntithesisExperimentSample | DriftExperimentSample
+
+export interface SyncLibraryStatus {
+  sourceLib: 'google_flow' | 'gemini_kimi'
+  name: string
+  eagleItemsCount: number
+  indexedPromptsCount: number
+  pendingNewCount: number
+  pendingModifiedCount: number
+  pendingRemovedCount: number
+  eagleUpdatedAt: string | null
+}
+
+export interface SyncStatusResponse {
+  state: 'idle' | 'running' | 'error'
+  inSync: boolean
+  totalPendingChanges: number
+  lastSyncedAt: string | null
+  indexedTotalPrompts: number
+  libraries: SyncLibraryStatus[]
+  runningSince: string | null
+  lastLogLines: string[]
+  lastError: string | null
+  lastDurationMs: number | null
 }

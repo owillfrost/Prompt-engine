@@ -1,20 +1,22 @@
 """
-Ingestão Completa 100% Read-Only (Escala 22.282 Prompts) -> SQLite FTS5 + Mapa 22k Pontos + Suíte JSON.
+Ingestão Completa 100% Read-Only (Sync Direto Eagle + Cache AST Incremental) -> SQLite FTS5 + Mapa + Suíte JSON.
 
 Fontes lidas exclusivamente em modo Read-Only:
   1. D:\\Meus Documentos\\Imagens\\Eagle.cool\\Google Flow + Prompts.library
   2. D:\\Meus Documentos\\Imagens\\Eagle.cool\\Gemini Kimi + Antigravity.library
-  3. B:\\AntiGravity\\Projeto Alfa\\data\\prompt_dna.sqlite (?mode=ro, 22.282 prompts)
+  3. B:\\AntiGravity\\Projeto Alfa\\data\\prompt_dna.sqlite (?mode=ro, seed inicial opcional)
   4. C:\\Users\\conta\\Documents\\antigravity\\fearless-euclid\\data\\posematch_eagle.sqlite (?mode=ro)
   5. C:\\Users\\conta\\Documents\\antigravity\\calm-brahmagupta\\.omnimage\\embeddings\\*.bin
 
 Saídas gravadas apenas em b:\\AntiGravity\\Prompt-EngineV1\\data\\:
-  - prompt_engine_v1.sqlite (22.282 prompts + tabela virtual prompts_fts FTS5 + vetores semânticos 24d)
-  - suite_google_flow.json (metadados globais, 12 clusters, 8 manchas vazias, pares, matrizes 2D, gaps, projetos)
+  - ast_cache.sqlite (cache incremental local da AST de 8 blocos por item_id + mtime_ms)
+  - prompt_engine_v1.sqlite (todos os prompts ativos + tabela virtual prompts_fts FTS5 + vetores semânticos 24d + sync_meta)
+  - suite_google_flow.json (metadados globais, clusters, manchas vazias, pares, matrizes 2D, gaps, projetos)
 """
 
 from __future__ import annotations
 
+import argparse
 import bisect
 import json
 import math
@@ -25,6 +27,7 @@ import struct
 import sys
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,6 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 OUTPUT_SUITE_JSON = DATA_DIR / "suite_google_flow.json"
 OUTPUT_DB = DATA_DIR / "prompt_engine_v1.sqlite"
+AST_CACHE_DB = DATA_DIR / "ast_cache.sqlite"
 
 ALFA_ROOT = Path(r"B:\AntiGravity\Projeto Alfa")
 ALFA_DB = ALFA_ROOT / "data" / "prompt_dna.sqlite"
@@ -48,13 +52,16 @@ CLIP_BIN = Path(
 
 GOOGLE_FLOW_LIB = Path(r"D:\Meus Documentos\Imagens\Eagle.cool\Google Flow + Prompts.library")
 GOOGLE_FLOW_IMAGES = GOOGLE_FLOW_LIB / "images"
-GEMINI_KIMI_IMAGES = Path(r"D:\Meus Documentos\Imagens\Eagle.cool\Gemini Kimi + Antigravity.library\images")
+GEMINI_KIMI_LIB = Path(r"D:\Meus Documentos\Imagens\Eagle.cool\Gemini Kimi + Antigravity.library")
+GEMINI_KIMI_IMAGES = GEMINI_KIMI_LIB / "images"
 
 if str(ALFA_ROOT) not in sys.path:
     sys.path.insert(0, str(ALFA_ROOT))
 
+from backend.corpus_store import load_posematch_telemetry, read_eagle_folder_map  # type: ignore
 from backend.domain_rules import check_physical_and_empirical_coherence  # type: ignore
 from backend.ontology import AXIS_RARITY_PRIORITY  # type: ignore
+from backend.parser_ast import parse_prompt_to_ast  # type: ignore
 
 THUMB_EXTS = ("_thumbnail.png", "_thumbnail.webp", "_thumbnail.jpg")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
@@ -92,6 +99,8 @@ AXIS_LABELS_PT = {
     "angle": "Câmera / Ângulo",
     "fabric": "Textura / Tecido",
     "wardrobe": "Figurino",
+    "color": "Cor",
+    "motif": "Fronteira Criativa",
 }
 
 MATRIX_AXIS_PAIRS = [
@@ -170,7 +179,134 @@ TAG_PT_NAMES = {
     "blonde_red_colored_hair": "Cabelo loiro / ruivo",
     "hair_styling_updo_bangs": "Coque / franja",
     "editorial_glam_makeup": "Make editorial",
+    # Fronteiras Criativas
+    "prism_refraction": "Prisma / refração espectral",
+    "double_exposure": "Dupla exposição",
+    "long_exposure": "Exposição longa / rastros",
+    "projector_light": "Projeção / light mapping",
+    "stained_glass": "Vitral / luz colorida",
+    "candlelight_amber": "Luz de velas",
+    "fisheye_optics": "Lente olho-de-peixe (fisheye)",
+    "monochrome_noir": "Monocromático P&B / prata",
+    "polaroid_patina": "Polaroid / pátina instantânea",
+    "rain_wet_glass": "Chuva / vidro molhado",
+    "fog_mist_veil": "Neblina / bruma atmosférica",
+    "smoke_haze": "Fumaça / névoa densa",
+    "snow_frost": "Neve / geada",
+    "underwater_weightless": "Submerso / gravidade zero",
+    "library_stacks": "Biblioteca / estantes altas",
+    "subway_transit": "Metrô / plataforma",
+    "elevator_box": "Elevador metálico",
+    "supermarket_aisle": "Corredor de supermercado",
+    "theater_stage": "Palco / teatro de veludo",
+    "arcade_neon": "Arcade / fliperama neon",
+    "greenhouse_glass": "Estufa de vidro / condensação",
+    "stairwell_echo": "Escadaria arquitetônica",
+    "feathers_plume": "Plumas / textura aérea",
+    "sequins_sparkle": "Paetês / reflexos especulares",
+    "surreal_dream": "Surrealismo onírico",
+    "shadow_play_gobo": "Jogo de sombras / persiana",
+    "laundromat_glow": "Lavanderia noturna",
 }
+
+MOTIF_KEYWORDS: Dict[str, Tuple[str, ...]] = {
+    "prism_refraction": ("prism", "prismatic"),
+    "double_exposure": ("double exposure", "double-exposure"),
+    "long_exposure": ("long exposure", "long-exposure"),
+    "projector_light": ("projector", "projection mapping"),
+    "stained_glass": ("stained glass", "stained-glass"),
+    "candlelight_amber": ("candlelight", "candles", "candle"),
+    "fisheye_optics": ("fisheye",),
+    "monochrome_noir": ("monochrome", "black and white", "black-and-white"),
+    "polaroid_patina": ("polaroid",),
+    "rain_wet_glass": ("rain", "raindrops", "raining"),
+    "fog_mist_veil": ("fog", "foggy", "mist", "misty"),
+    "smoke_haze": ("smoke", "atmospheric haze", "incense smoke"),
+    "snow_frost": ("snow", "snowing", "frost"),
+    "underwater_weightless": ("underwater", "submerged"),
+    "library_stacks": ("library",),
+    "subway_transit": ("subway", "metro platform"),
+    "elevator_box": ("elevator",),
+    "supermarket_aisle": ("supermarket", "grocery aisle"),
+    "theater_stage": ("theater", "theatre"),
+    "arcade_neon": ("arcade",),
+    "greenhouse_glass": ("greenhouse", "estufa"),
+    "stairwell_echo": ("stairwell",),
+    "feathers_plume": ("feathers", "feather"),
+    "sequins_sparkle": ("sequins", "sequin", "sequined"),
+    "surreal_dream": ("surreal", "surrealism"),
+    "shadow_play_gobo": ("shadow play", "venetian blind"),
+    "laundromat_glow": ("laundromat",),
+}
+MOTIF_RES: Dict[str, re.Pattern[str]] = {
+    k: re.compile(r"\b(?:" + "|".join(re.escape(w) for w in ws) + r")\b")
+    for k, ws in MOTIF_KEYWORDS.items()
+}
+MOTIF_MICRO_LOCATIONS = {
+    "library_stacks",
+    "subway_transit",
+    "elevator_box",
+    "supermarket_aisle",
+    "theater_stage",
+    "arcade_neon",
+    "greenhouse_glass",
+    "stairwell_echo",
+    "laundromat_glow",
+}
+GAP_BRIDGE_RE = re.compile(r'"gap_bridge"\s*:\s*"([^"]+)"', re.I)
+FORBIDDEN_STRIP_RE = re.compile(
+    r"(?:forbidden_terms|negative_prompt|\[NEGATIVE PROMPT[^\]]*\]|\bAvoid)\s*:?[^\n\]]*",
+    re.I,
+)
+
+
+def extract_clean_motifs(text: str) -> List[str]:
+    if not text:
+        return []
+    low = FORBIDDEN_STRIP_RE.sub("", text).lower()
+    out: List[str] = []
+    for mk, words in MOTIF_KEYWORDS.items():
+        if any(w in low for w in words):
+            if MOTIF_RES[mk].search(low):
+                out.append(mk)
+    return out
+
+
+def is_frontier_pair_coherent(motif: str, ax2: str, t2: str, ax3: str, t3: str) -> bool:
+    if motif in MOTIF_MICRO_LOCATIONS and ax2 == "environment":
+        return False
+    if motif == "underwater_weightless":
+        if t2 in (
+            "bedroom_bed",
+            "bathroom_mirror",
+            "living_room_office",
+            "cafe_bar_restaurant",
+            "car_train_transit",
+            "studio_seamless_backdrop",
+            "leather_suede",
+            "wool_tweed_merino",
+            "velvet_corduroy",
+            "hoodie_sweatshirt",
+            "blazer_coat_jacket",
+            "knitwear_turtleneck",
+        ):
+            return False
+        if t3 in ("direct_flash_on_axis", "indoor_ambient_mixed"):
+            return False
+    if motif == "snow_frost" and t2 in ("bikini_swimwear", "beach_pool_water", "bathroom_mirror", "bedroom_bed"):
+        return False
+    if motif == "candlelight_amber" and t3 in ("harsh_midday_sun", "window_daylight_soft", "studio_softbox_strobe"):
+        return False
+    if motif == "rain_wet_glass" and t2 == "studio_seamless_backdrop":
+        return False
+    if motif == "monochrome_noir" and t3 in ("night_neon_sodium",):
+        return False
+    if motif == "arcade_neon" and t3 in ("harsh_midday_sun", "window_daylight_soft"):
+        return False
+    if motif == "theater_stage" and t3 == "harsh_midday_sun":
+        return False
+    return True
+
 
 CAM_TECH_RE = re.compile(r"\b(\d{2,3}mm|f/\d|iphone|canon|sony|hasselblad|leica|fujifilm|35mm|85mm)\b", re.I)
 LUZ_TECH_RE = re.compile(r"\b(kelvin|\d{4}k|flash|softbox|strobe|window|chiaroscuro|backlight|daylight|sunlight|luz)\b", re.I)
@@ -622,59 +758,401 @@ def spherical_kmeans_22k(
     return remapped_assign, node_x, node_y, clusters_meta
 
 
+def fmt_pt(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
+
+
+def read_eagle_mtimes(lib_root: Path, images_dir: Path) -> Tuple[Dict[str, int], int]:
+    """Lê `mtime.json` e `.info` do Eagle em modo Read-Only, retornando (id -> mtime_ms, lib_mtime_ts)."""
+    eagle_mtimes: Dict[str, int] = {}
+    mtime_file = lib_root / "mtime.json"
+    lib_mtime_ts = 0
+    if mtime_file.exists():
+        try:
+            lib_mtime_ts = int(mtime_file.stat().st_mtime * 1000)
+            parsed = json.loads(mtime_file.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(parsed, dict):
+                for k, v in parsed.items():
+                    if k == "all":
+                        continue
+                    try:
+                        eagle_mtimes[str(k)] = int(v)
+                    except (TypeError, ValueError):
+                        continue
+        except Exception:
+            pass
+
+    if images_dir.is_dir():
+        try:
+            with os.scandir(images_dir) as entries:
+                for entry in entries:
+                    if not entry.is_dir() or not entry.name.endswith(".info"):
+                        continue
+                    iid = entry.name[:-5]
+                    if iid not in eagle_mtimes:
+                        mp = Path(entry.path) / "metadata.json"
+                        try:
+                            eagle_mtimes[iid] = int(mp.stat().st_mtime * 1000) if mp.exists() else 0
+                        except OSError:
+                            eagle_mtimes[iid] = 0
+        except OSError:
+            pass
+
+    return eagle_mtimes, lib_mtime_ts
+
+
+def sync_eagle_ast_cache(
+    telemetry_map: Dict[str, dict],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """
+    Sincroniza diretamente as bibliotecas Eagle em modo 100% Read-Only usando cache incremental local
+    (`data/ast_cache.sqlite`), parseando apenas itens novos ou modificados.
+    """
+    libraries = [
+        ("google_flow", GOOGLE_FLOW_LIB, GOOGLE_FLOW_IMAGES),
+    ]
+
+    cache_conn = sqlite3.connect(AST_CACHE_DB)
+    cache_conn.row_factory = sqlite3.Row
+    sync_stats: Dict[str, Dict[str, Any]] = {}
+    active_rows: List[Dict[str, Any]] = []
+
+    try:
+        cache_conn.executescript(
+            """
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            CREATE TABLE IF NOT EXISTS ast_cache (
+                source_lib TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                mtime_ms INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                folder_ids_json TEXT NOT NULL DEFAULT '[]',
+                folder_fallback TEXT NOT NULL DEFAULT '',
+                raw_prompt TEXT NOT NULL DEFAULT '',
+                clean_positive TEXT NOT NULL DEFAULT '',
+                dialect TEXT NOT NULL DEFAULT 'qwen_natural',
+                ast_json TEXT NOT NULL DEFAULT '{}',
+                axis_tags_json TEXT NOT NULL DEFAULT '{}',
+                extras_json TEXT NOT NULL DEFAULT '{}',
+                star INTEGER NOT NULL DEFAULT 0,
+                btime INTEGER NOT NULL DEFAULT 0,
+                eagle_tags_json TEXT NOT NULL DEFAULT '[]',
+                eagle_tags_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (source_lib, item_id)
+            );
+            """
+        )
+
+        conn_alfa_ro = open_ro(ALFA_DB) if ALFA_DB.exists() else None
+        alfa_mtime_ms = int(ALFA_DB.stat().st_mtime * 1000) if ALFA_DB.exists() else 0
+
+        try:
+            for source_lib, lib_root, images_dir in libraries:
+                eagle_mtimes, lib_mtime_ts = read_eagle_mtimes(lib_root, images_dir)
+                current_ids = set(eagle_mtimes.keys())
+                folder_map = read_eagle_folder_map(lib_root)
+
+                existing_rows = cache_conn.execute(
+                    "SELECT item_id, mtime_ms, status FROM ast_cache WHERE source_lib = ?",
+                    (source_lib,),
+                ).fetchall()
+                cache_meta: Dict[str, Tuple[int, str]] = {
+                    str(r["item_id"]): (int(r["mtime_ms"]), str(r["status"])) for r in existing_rows
+                }
+
+                # Seed inicial opcional (100% RO) a partir do Projeto Alfa para evitar reparse dos primeiros 22k
+                if len(cache_meta) == 0 and conn_alfa_ro is not None and len(current_ids) > 0:
+                    alfa_rows = conn_alfa_ro.execute(
+                        """
+                        SELECT item_id, title, folder, dialect, raw_prompt, clean_positive,
+                               ast_json, axis_tags_json, extras_json, star, eagle_tags_count
+                        FROM prompts
+                        WHERE source_lib = ?
+                        """,
+                        (source_lib,),
+                    ).fetchall()
+                    seed_batch = []
+                    for ar in alfa_rows:
+                        iid = str(ar["item_id"])
+                        if iid not in current_ids:
+                            continue
+                        em_ts = eagle_mtimes.get(iid, 0)
+                        if alfa_mtime_ms > 0 and em_ts > alfa_mtime_ms:
+                            continue
+                        seed_batch.append(
+                            (
+                                source_lib,
+                                iid,
+                                em_ts,
+                                "active",
+                                str(ar["title"] or iid),
+                                "[]",
+                                str(ar["folder"] or ""),
+                                str(ar["raw_prompt"] or ""),
+                                str(ar["clean_positive"] or ""),
+                                str(ar["dialect"] or "qwen_natural"),
+                                str(ar["ast_json"] or "{}"),
+                                str(ar["axis_tags_json"] or "{}"),
+                                str(ar["extras_json"] or "{}"),
+                                int(ar["star"] or 0),
+                                0,
+                                "[]",
+                                int(ar["eagle_tags_count"] or 0),
+                            )
+                        )
+                        cache_meta[iid] = (em_ts, "active")
+
+                    if seed_batch:
+                        cache_conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO ast_cache (
+                                source_lib, item_id, mtime_ms, status, title, folder_ids_json,
+                                folder_fallback, raw_prompt, clean_positive, dialect, ast_json,
+                                axis_tags_json, extras_json, star, btime, eagle_tags_json, eagle_tags_count
+                            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            seed_batch,
+                        )
+                        cache_conn.commit()
+                        print(f"[Ingest] {source_lib}: seed RO inicial de {len(seed_batch)} ASTs via Projeto Alfa")
+
+                removed_ids = [iid for iid in cache_meta.keys() if iid not in current_ids]
+                if removed_ids:
+                    for i in range(0, len(removed_ids), 500):
+                        chunk = removed_ids[i : i + 500]
+                        placeholders = ",".join("?" for _ in chunk)
+                        cache_conn.execute(
+                            f"DELETE FROM ast_cache WHERE source_lib = ? AND item_id IN ({placeholders})",
+                            [source_lib, *chunk],
+                        )
+                    cache_conn.commit()
+
+                to_parse_ids = [
+                    iid
+                    for iid, em_ts in eagle_mtimes.items()
+                    if iid not in cache_meta or cache_meta[iid][0] != em_ts
+                ]
+
+                def _parse_item(iid: str) -> Tuple[Any, ...]:
+                    em_ts = eagle_mtimes.get(iid, 0)
+                    meta_path = images_dir / f"{iid}.info" / "metadata.json"
+                    if not meta_path.exists():
+                        return (
+                            source_lib, iid, em_ts, "error", "", "[]", "", "", "", "qwen_natural",
+                            "{}", "{}", "{}", 0, 0, "[]", 0,
+                        )
+                    try:
+                        data = json.loads(meta_path.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
+                        return (
+                            source_lib, iid, em_ts, "error", "", "[]", "", "", "", "qwen_natural",
+                            "{}", "{}", "{}", 0, 0, "[]", 0,
+                        )
+                    if data.get("isDeleted"):
+                        return (
+                            source_lib, iid, em_ts, "deleted", "", "[]", "", "", "", "qwen_natural",
+                            "{}", "{}", "{}", 0, 0, "[]", 0,
+                        )
+                    ann = (data.get("annotation") or "").strip()
+                    if not ann:
+                        return (
+                            source_lib, iid, em_ts, "empty", "", "[]", "", "", "", "qwen_natural",
+                            "{}", "{}", "{}", 0, 0, "[]", 0,
+                        )
+
+                    pose_meta = telemetry_map.get(iid) or {}
+                    ast = parse_prompt_to_ast(ann, pose_meta=pose_meta)
+                    fids = [str(f) for f in (data.get("folders") or []) if f]
+                    raw_tags = data.get("tags")
+                    tags_list = [str(t) for t in raw_tags if t] if isinstance(raw_tags, list) else []
+                    return (
+                        source_lib,
+                        iid,
+                        em_ts,
+                        "active",
+                        str(data.get("name") or iid),
+                        json.dumps(fids, ensure_ascii=False),
+                        "",
+                        ann,
+                        str(ast.get("clean_positive_text") or ""),
+                        str(ast.get("dialect") or "qwen_natural"),
+                        json.dumps(ast.get("blocks") or {}, ensure_ascii=False),
+                        json.dumps(ast.get("axis_tags") or {}, ensure_ascii=False),
+                        json.dumps(ast.get("extras") or {}, ensure_ascii=False),
+                        int(data.get("star") or 0),
+                        int(data.get("btime") or 0),
+                        json.dumps(tags_list, ensure_ascii=False),
+                        len(tags_list),
+                    )
+
+                if to_parse_ids:
+                    parsed_batches: List[Tuple[Any, ...]] = []
+                    with ThreadPoolExecutor(max_workers=16) as pool:
+                        for row_tuple in pool.map(_parse_item, to_parse_ids):
+                            parsed_batches.append(row_tuple)
+                    cache_conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO ast_cache (
+                            source_lib, item_id, mtime_ms, status, title, folder_ids_json,
+                            folder_fallback, raw_prompt, clean_positive, dialect, ast_json,
+                            axis_tags_json, extras_json, star, btime, eagle_tags_json, eagle_tags_count
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        parsed_batches,
+                    )
+                    cache_conn.commit()
+
+                lib_active_rows = cache_conn.execute(
+                    """
+                    SELECT item_id, source_lib, title, folder_ids_json, folder_fallback,
+                           dialect, raw_prompt, clean_positive, ast_json, axis_tags_json,
+                           extras_json, star, btime, eagle_tags_json, eagle_tags_count
+                    FROM ast_cache
+                    WHERE source_lib = ? AND status = 'active'
+                    """,
+                    (source_lib,),
+                ).fetchall()
+
+                for cr in lib_active_rows:
+                    iid = str(cr["item_id"])
+                    pose_meta = telemetry_map.get(iid) or {}
+                    fids = json.loads(cr["folder_ids_json"] or "[]")
+                    resolved_folders = [folder_map.get(fid, fid) for fid in fids if fid]
+                    if resolved_folders:
+                        folder_str = resolved_folders[0]
+                    elif cr["folder_fallback"]:
+                        fb = str(cr["folder_fallback"])
+                        folder_str = folder_map.get(fb, fb)
+                    elif pose_meta.get("folder_names"):
+                        folder_str = str(pose_meta["folder_names"][0])
+                    else:
+                        folder_str = "Sem Pasta"
+
+                    active_rows.append(
+                        {
+                            "item_id": iid,
+                            "source_lib": source_lib,
+                            "title": str(cr["title"] or iid),
+                            "folder": folder_str,
+                            "dialect": str(cr["dialect"] or "qwen_natural"),
+                            "raw_prompt": str(cr["raw_prompt"] or ""),
+                            "clean_positive": str(cr["clean_positive"] or ""),
+                            "ast_json": str(cr["ast_json"] or "{}"),
+                            "axis_tags_json": str(cr["axis_tags_json"] or "{}"),
+                            "extras_json": str(cr["extras_json"] or "{}"),
+                            "pose_type": pose_meta.get("pose_type") or "",
+                            "yaw": pose_meta.get("yaw"),
+                            "pitch": pose_meta.get("pitch"),
+                            "roll": pose_meta.get("roll"),
+                            "badge": pose_meta.get("badge") or "",
+                            "star": int(cr["star"] or 0),
+                            "btime": int(cr["btime"] or 0),
+                            "eagle_tags_json": str(cr["eagle_tags_json"] or "[]"),
+                            "eagle_tags_count": int(cr["eagle_tags_count"] or 0),
+                            "face_confidence": pose_meta.get("face_confidence"),
+                        }
+                    )
+
+                sync_stats[source_lib] = {
+                    "eagle_total": len(current_ids),
+                    "active_prompts": len(lib_active_rows),
+                    "new_or_modified": len(to_parse_ids),
+                    "removed": len(removed_ids),
+                    "lib_mtime_ts": lib_mtime_ts,
+                }
+                print(
+                    f"[Ingest] {source_lib}: eagle={len(current_ids)} | "
+                    f"novos/alterados={len(to_parse_ids)} | removidos={len(removed_ids)} | "
+                    f"ativos={len(lib_active_rows)}"
+                )
+        finally:
+            if conn_alfa_ro is not None:
+                conn_alfa_ro.close()
+
+        cache_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        cache_conn.execute("PRAGMA journal_mode = DELETE")
+        cache_conn.commit()
+    finally:
+        cache_conn.close()
+
+    return active_rows, sync_stats
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Ingestão Read-Only Eagle -> Prompt Engine V1")
+    parser.add_argument(
+        "--stage-only",
+        action="store_true",
+        help="Grava saídas temporárias .next para swap seguro pelo servidor Vite.",
+    )
+    args, _ = parser.parse_known_args()
+
     t0 = time.time()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not ALFA_DB.exists():
-        raise FileNotFoundError(f"Banco Alfa não encontrado: {ALFA_DB}")
 
-    print("[Ingest 22k] Carregando embeddings EmbeddingGemma-2 & CLIP (RO)...")
+    print("[Ingest] Carregando embeddings EmbeddingGemma-2 & CLIP (RO)...")
     gemma_id_to_idx, gemma_mat = load_nonzero_embeddings(GEMMA2_BIN)
     clip_id_to_idx, clip_mat = load_nonzero_embeddings(CLIP_BIN)
 
-    conn_alfa = open_ro(ALFA_DB)
+    telemetry_map, _ = load_posematch_telemetry()
     conn_pm = open_ro(POSEMATCH_DB) if POSEMATCH_DB.exists() else None
 
     try:
-        cur = conn_alfa.cursor()
-
         pm_tags_by_id: Dict[str, List[str]] = {}
+        pm_items_count = 0
         if conn_pm is not None:
             for r in conn_pm.execute("SELECT item_id, tag FROM item_tags").fetchall():
                 pm_tags_by_id.setdefault(r["item_id"], []).append(r["tag"])
+            pm_cnt_row = conn_pm.execute("SELECT COUNT(*) FROM items").fetchone()
+            pm_items_count = int(pm_cnt_row[0]) if pm_cnt_row else 0
 
-        rows = cur.execute(
-            """
-            SELECT item_id, source_lib, title, folder, dialect, raw_prompt, clean_positive,
-                   ast_json, axis_tags_json, extras_json, pose_type, yaw, pitch, roll, badge,
-                   star, eagle_tags_count, face_confidence
-            FROM prompts
-            WHERE source_lib IN ('google_flow', 'gemini_kimi')
-            """
-        ).fetchall()
+        rows, sync_stats = sync_eagle_ast_cache(telemetry_map)
 
         n_total = len(rows)
         gf_total = sum(1 for r in rows if r["source_lib"] == "google_flow")
         gk_total = sum(1 for r in rows if r["source_lib"] == "gemini_kimi")
-        print(f"[Ingest 22k] Lidos {n_total} prompts (Google Flow={gf_total}, Gemini Kimi={gk_total}) em {time.time()-t0:.1f}s")
+        print(f"[Ingest] Corpus unificado: {n_total} prompts (Google Flow={gf_total}, Gemini Kimi={gk_total}) em {time.time()-t0:.1f}s")
 
-        # 1. Primeira passagem: estatísticas globais, matrizes 2D/3D (sobre Google Flow 19.227) & skeleton counts
+        # 1. Primeira passagem: estatísticas globais, matrizes 2D/3D (all-tag reais) & skeleton counts
         axis_counts_global: Dict[str, Counter] = {ax: Counter() for ax in AXIS_RARITY_PRIORITY}
         prim_counts_gf: Dict[str, Counter] = {ax: Counter() for ax in AXIS_RARITY_PRIORITY}
         prim_cooc_gf: Counter = Counter()
-        tri_cooc_gf: Counter = Counter()
+
+        ALL_GAP_AXES = ("environment", "lighting", "angle", "pose", "fabric", "wardrobe")
+        TRIAD_AXIS_TRIPLES = (
+            ("environment", "lighting", "angle"),
+            ("pose", "environment", "lighting"),
+            ("pose", "lighting", "angle"),
+            ("fabric", "environment", "lighting"),
+            ("wardrobe", "environment", "angle"),
+            ("pose", "fabric", "angle"),
+            ("environment", "lighting", "fabric"),
+            ("pose", "wardrobe", "lighting"),
+        )
+        all_counts_gf: Dict[str, Counter] = {ax: Counter() for ax in ALL_GAP_AXES}
+        all_cooc_gf: Counter = Counter()
+        all_tri_cooc_gf: Counter = Counter()
+        motif_counts_gf: Counter = Counter()
+        motif_tri_cooc_gf: Counter = Counter()
+        row_motifs_by_id: Dict[str, List[str]] = {}
+        tested_bridges_raw: Dict[str, List[Tuple[str, int]]] = {}
 
         proj_totals: Counter = Counter()
         proj_subfolders: Dict[str, Counter] = {}
         proj_formats: Dict[str, Counter] = {}
         proj_prim_counts: Dict[str, Dict[str, Counter]] = {}
         proj_prim_cooc: Dict[str, Counter] = {}
+        proj_all_counts: Dict[str, Dict[str, Counter]] = {}
+        proj_all_cooc: Dict[str, Counter] = {}
         skeleton_counts: Counter = Counter()
 
         parsed_rows: List[Tuple[Any, str, str, str, List[str], Dict[str, Any], Dict[str, List[str]], Dict[str, Any], Dict[str, str], str]] = []
 
         for r in rows:
             src = r["source_lib"]
+            iid = r["item_id"]
             raw = r["raw_prompt"] or ""
             ast = json.loads(r["ast_json"] or "{}")
             ax = json.loads(r["axis_tags_json"] or "{}")
@@ -692,6 +1170,8 @@ def main() -> None:
             proj_formats.setdefault(proj, Counter())[macro_fmt] += 1
             p_prim = proj_prim_counts.setdefault(proj, {k: Counter() for k in AXIS_RARITY_PRIORITY})
             p_cooc = proj_prim_cooc.setdefault(proj, Counter())
+            p_all = proj_all_counts.setdefault(proj, {k: Counter() for k in ALL_GAP_AXES})
+            p_all_cooc = proj_all_cooc.setdefault(proj, Counter())
 
             for cat, tlist in ax.items():
                 if cat in axis_counts_global:
@@ -715,8 +1195,55 @@ def main() -> None:
                     if src == "google_flow":
                         prim_cooc_gf[(ca, prim[ca], cb, prim[cb])] += 1
 
-            if src == "google_flow" and "environment" in prim and "lighting" in prim and "angle" in prim:
-                tri_cooc_gf[(prim["environment"], prim["lighting"], prim["angle"])] += 1
+            # Contagem completa (all-tag) por eixo para eliminar falsos O=0
+            ax_sets: Dict[str, List[str]] = {
+                cax: list(dict.fromkeys(ax.get(cax) or []))
+                for cax in ALL_GAP_AXES
+            }
+            for cax, tlist in ax_sets.items():
+                for tg in tlist:
+                    p_all[cax][tg] += 1
+                    if src == "google_flow":
+                        all_counts_gf[cax][tg] += 1
+
+            for ca, cb in MATRIX_AXIS_PAIRS:
+                ta_list = ax_sets.get(ca, [])
+                tb_list = ax_sets.get(cb, [])
+                if ta_list and tb_list:
+                    for ta in ta_list:
+                        for tb in tb_list:
+                            p_all_cooc[(ca, ta, cb, tb)] += 1
+                            if src == "google_flow":
+                                all_cooc_gf[(ca, ta, cb, tb)] += 1
+
+            if src == "google_flow":
+                for c1, c2, c3 in TRIAD_AXIS_TRIPLES:
+                    l1, l2, l3 = ax_sets.get(c1, []), ax_sets.get(c2, []), ax_sets.get(c3, [])
+                    if l1 and l2 and l3:
+                        for t1 in l1:
+                            for t2 in l2:
+                                for t3 in l3:
+                                    all_tri_cooc_gf[(c1, t1, c2, t2, c3, t3)] += 1
+
+                motifs = extract_clean_motifs(r["clean_positive"] or raw)
+                if motifs:
+                    row_motifs_by_id[iid] = motifs
+                    for mf in motifs:
+                        motif_counts_gf[mf] += 1
+                        for ax2 in ("environment", "fabric", "pose", "wardrobe"):
+                            for t2 in ax_sets.get(ax2, []):
+                                for ax3 in ("lighting", "angle"):
+                                    for t3 in ax_sets.get(ax3, []):
+                                        motif_tri_cooc_gf[(mf, ax2, t2, ax3, t3)] += 1
+
+            if '"gap_bridge"' in raw:
+                bm = GAP_BRIDGE_RE.search(raw)
+                if bm:
+                    raw_bridge = bm.group(1).strip()
+                    parts_b = [p.strip() for p in re.split(r"\s*×\s*|\s+[xX]\s+", raw_bridge) if p.strip()]
+                    if len(parts_b) >= 2:
+                        norm_bridge = " × ".join(parts_b)
+                        tested_bridges_raw.setdefault(norm_bridge, []).append((iid, int(r.get("btime") or 0)))
 
             parsed_rows.append((r, macro_fmt, detected_dialect, skel_sig, top_keys, ast, ax, extras, prim, proj))
 
@@ -911,15 +1438,18 @@ def main() -> None:
                 if st not in struct_vocab:
                     struct_vocab[st] = len(struct_vocab)
 
+            eagle_native_tags = json.loads(r.get("eagle_tags_json") or "[]")
+            combined_tags = list(dict.fromkeys([*pm_tags, *eagle_native_tags]))[:12]
+
             item_obj = {
                 "id": iid,
                 "sourceLib": src,
                 "title": str(r["title"] or iid),
                 "project": proj,
                 "folders": [r["folder"]] if r["folder"] and r["folder"] != "Sem Pasta" else [],
-                "eagleTags": pm_tags[:12],
+                "eagleTags": combined_tags,
                 "star": star_val,
-                "btime": 0,
+                "btime": int(r.get("btime") or 0),
                 "thumbnailUrl": f"/api/thumbnail/{src}/{iid}",
                 "rawPrompt": r["raw_prompt"] or "",
                 "cleanPrompt": clean_prompt,
@@ -1023,15 +1553,14 @@ def main() -> None:
             plist.sort(key=lambda x: (x["star"], x["attributes"]["estrutura"]["filledAttributesCount"], x["rarity"]["percentile"]), reverse=True)
 
         target_gf_projects = [
-            "Iberica character",
-            "Character Infusion",
-            "Iberica",
-            "Imagen 4",
-            "Eccomerce style",
-            "Lua's Collection",
-            "Testes de Fotos",
+            p
+            for p, cnt in proj_totals.most_common()
+            if p not in ("Gemini Kimi + Antigravity", "Sem Projeto") and cnt >= 25
         ]
-        for proj_n in target_gf_projects + ["Gemini Kimi + Antigravity"]:
+        all_target_projects = target_gf_projects + (
+            ["Gemini Kimi + Antigravity"] if proj_totals["Gemini Kimi + Antigravity"] > 0 else []
+        )
+        for proj_n in all_target_projects:
             pool = by_proj.get(proj_n, [])
             added = 0
             for fmt in ("json", "sections", "single_paragraph"):
@@ -1061,10 +1590,33 @@ def main() -> None:
                 feat_pool.append(cand)
                 added += 1
 
-        # Matrizes 2D e Gaps sobre os 19.227 prompts de Google Flow
+        # Matrizes 2D, Tríades Reais (all-tag O=0) e Fronteiras Criativas sobre Google Flow
         item_by_id = {it["id"]: it for it in all_items}
+        donor_usage_counter: Counter = Counter()
+
+        def score_donor_item(it: Dict[str, Any], attr_key: str) -> float:
+            raw_len = len(it.get("rawPrompt") or "")
+            clean_p = (it.get("cleanPrompt") or "").strip()
+            tags_len = len(it["attributes"][attr_key]["tags"])
+            specificity = 22.0 / max(1, tags_len)
+            length_bonus = 10.0 if 320 <= raw_len <= 3800 else (-12.0 if raw_len > 5200 else 2.0)
+            boilerplate_pen = -14.0 if re.match(r"^(?:#prompt\s+\d+|Create image:\s*use the attached|STUDIO EDITORIAL)", clean_p, re.I) else 0.0
+            mat_bonus = float(it["maturity"]["score"]) * 0.24 + float(it["rarity"]["percentile"]) * 0.1
+            reuse_pen = float(donor_usage_counter[it["id"]]) * 7.5
+            return specificity + length_bonus + boilerplate_pen + mat_bonus - reuse_pen
 
         def find_donor(axis: str, tag: str) -> Optional[str]:
+            if axis == "motif":
+                cands = [it for it in feat_pool if tag in (row_motifs_by_id.get(it["id"]) or [])]
+                if not cands:
+                    cands = [it for it in all_items if tag in (row_motifs_by_id.get(it["id"]) or [])]
+                if not cands:
+                    return None
+                cands.sort(key=lambda x: score_donor_item(x, "estilo"), reverse=True)
+                chosen_id = cands[0]["id"]
+                donor_usage_counter[chosen_id] += 1
+                return chosen_id
+
             attr_key = {
                 "environment": "cenario",
                 "lighting": "luz",
@@ -1075,22 +1627,25 @@ def main() -> None:
             }.get(axis, "sujeito")
             cands = [it for it in feat_pool if tag in it["attributes"][attr_key]["tags"]]
             if not cands:
-                cands = [it for it in all_items[:3000] if tag in it["attributes"][attr_key]["tags"]]
+                cands = [it for it in all_items if tag in it["attributes"][attr_key]["tags"]]
             if not cands:
                 return None
-            cands.sort(key=lambda x: x["maturity"]["score"], reverse=True)
-            return cands[0]["id"]
+            cands.sort(key=lambda x: score_donor_item(x, attr_key), reverse=True)
+            chosen_id = cands[0]["id"]
+            donor_usage_counter[chosen_id] += 1
+            return chosen_id
 
         matrices: List[Dict[str, Any]] = []
         project_gaps: List[Dict[str, Any]] = []
         global_triad_gaps: List[Dict[str, Any]] = []
+        creative_frontier_gaps: List[Dict[str, Any]] = []
         global_underexplored: List[Dict[str, Any]] = []
 
-        scopes_to_build = ["all"] + target_gf_projects + ["Gemini Kimi + Antigravity"]
+        scopes_to_build = ["all"] + all_target_projects
         for scope in scopes_to_build:
             total_s = gf_total if scope == "all" else proj_totals[scope]
-            cnt_map = prim_counts_gf if scope == "all" else proj_prim_counts[scope]
-            cooc_src = prim_cooc_gf if scope == "all" else proj_prim_cooc[scope]
+            cnt_map = all_counts_gf if scope == "all" else proj_all_counts[scope]
+            cooc_src = all_cooc_gf if scope == "all" else proj_all_cooc[scope]
 
             for ca, cb in MATRIX_AXIS_PAIRS:
                 rows_tags = [t for t in AXIS_RARITY_PRIORITY[ca] if cnt_map[ca][t] > 0][:9]
@@ -1146,15 +1701,15 @@ def main() -> None:
                                     "donorAId": find_donor(ca, ta),
                                     "donorBId": find_donor(cb, tb),
                                     "title": f"{human_tag(ta)} × {human_tag(tb)}",
-                                    "rationale": f"Dentro de '{scope}' (N={total_s}), '{human_tag(ta)}' ({fa}x) e '{human_tag(tb)}' ({fb}x) nunca se cruzaram (O=0, E={exp}).",
+                                    "rationale": f"Dentro de '{scope}' (N={total_s}), '{human_tag(ta)}' ({fa}x) e '{human_tag(tb)}' ({fb}x) nunca se cruzaram (O=0 real, E={exp}).",
                                 }
                             )
-                        elif scope == "all" and coherent and fa >= 80 and fb >= 80 and exp >= 10.0 and lift < 0.36:
+                        elif scope == "all" and coherent and fa >= 120 and fb >= 120 and exp >= 12.0 and 0 < obs and lift < 0.45:
                             global_underexplored.append(
                                 {
                                     "id": f"g2d:{ca}:{ta}:{cb}:{tb}",
                                     "kind": "global_2d_low_lift",
-                                    "scope": "Google Flow (19.227)",
+                                    "scope": f"Google Flow ({fmt_pt(gf_total)})",
                                     "axisA": ca,
                                     "tagA": ta,
                                     "freqA": fa,
@@ -1188,63 +1743,179 @@ def main() -> None:
                     }
                 )
 
-        # Tríades globais O=0
-        for e_tag in AXIS_RARITY_PRIORITY["environment"]:
-            fe = prim_counts_gf["environment"][e_tag]
-            if fe < 120:
-                continue
-            for l_tag in AXIS_RARITY_PRIORITY["lighting"]:
-                fl = prim_counts_gf["lighting"][l_tag]
-                if fl < 120:
+        # Tríades globais multi-eixo com O=0 REAL (contagem all-tag em todos os eixos)
+        raw_triad_candidates: List[Tuple[float, str, str, int, str, str, int, str, str, int]] = []
+        seen_triad_keys = set()
+        for c1, c2, c3 in TRIAD_AXIS_TRIPLES:
+            for t1, f1 in all_counts_gf[c1].items():
+                if f1 < 60:
                     continue
-                for a_tag in AXIS_RARITY_PRIORITY["angle"]:
-                    fa = prim_counts_gf["angle"][a_tag]
-                    if fa < 120:
+                for t2, f2 in all_counts_gf[c2].items():
+                    if f2 < 60:
                         continue
-                    obs = tri_cooc_gf[(e_tag, l_tag, a_tag)]
-                    if obs != 0:
+                    for t3, f3 in all_counts_gf[c3].items():
+                        if f3 < 60:
+                            continue
+                        canonical_set = tuple(sorted(((c1, t1), (c2, t2), (c3, t3))))
+                        if canonical_set in seen_triad_keys:
+                            continue
+                        if all_tri_cooc_gf[(c1, t1, c2, t2, c3, t3)] != 0:
+                            continue
+                        exp = round((f1 * f2 * f3) / (max(1, gf_total) ** 2), 2)
+                        if exp < 0.6:
+                            continue
+                        dummy_blocks = {
+                            "environment_props": {"text": t1 if c1 == "environment" else (t2 if c2 == "environment" else (t3 if c3 == "environment" else ""))},
+                            "lighting_physics": {"text": t1 if c1 == "lighting" else (t2 if c2 == "lighting" else (t3 if c3 == "lighting" else ""))},
+                            "camera_framing_occlusion": {"text": t1 if c1 == "angle" else (t2 if c2 == "angle" else (t3 if c3 == "angle" else ""))},
+                            "wardrobe_materials": {"text": " ".join(x for c, x in ((c1, t1), (c2, t2), (c3, t3)) if c in ("fabric", "wardrobe"))},
+                            "body_mechanics_pose": {"text": t1 if c1 == "pose" else (t2 if c2 == "pose" else (t3 if c3 == "pose" else ""))},
+                        }
+                        ax_map: Dict[str, List[str]] = {}
+                        for cx, tx in ((c1, t1), (c2, t2), (c3, t3)):
+                            ax_map.setdefault(cx, []).append(tx)
+                        coherent, _ = check_physical_and_empirical_coherence(dummy_blocks, conn=None, axis_tags=ax_map)
+                        if coherent:
+                            seen_triad_keys.add(canonical_set)
+                            raw_triad_candidates.append((exp, c1, t1, f1, c2, t2, f2, c3, t3, f3))
+
+        raw_triad_candidates.sort(key=lambda x: x[0], reverse=True)
+        triad_tag_quota: Counter = Counter()
+        for exp, c1, t1, f1, c2, t2, f2, c3, t3, f3 in raw_triad_candidates:
+            if len(global_triad_gaps) >= 55:
+                break
+            if triad_tag_quota[(c1, t1)] >= 7 or triad_tag_quota[(c2, t2)] >= 7 or triad_tag_quota[(c3, t3)] >= 7:
+                continue
+            triad_tag_quota[(c1, t1)] += 1
+            triad_tag_quota[(c2, t2)] += 1
+            triad_tag_quota[(c3, t3)] += 1
+            global_triad_gaps.append(
+                {
+                    "id": f"g3d:{c1}:{t1}:{c2}:{t2}:{c3}:{t3}",
+                    "kind": "global_3d_zero",
+                    "scope": f"Google Flow ({fmt_pt(gf_total)})",
+                    "axisA": c1,
+                    "tagA": t1,
+                    "freqA": f1,
+                    "axisB": c2,
+                    "tagB": t2,
+                    "freqB": f2,
+                    "axisC": c3,
+                    "tagC": t3,
+                    "freqC": f3,
+                    "observedCount": 0,
+                    "expectedCount": exp,
+                    "lift": 0.0,
+                    "isCoherent": True,
+                    "donorAId": find_donor(c1, t1),
+                    "donorBId": find_donor(c2, t2),
+                    "donorCId": find_donor(c3, t3),
+                    "title": f"{human_tag(t1)} × {human_tag(t2)} × {human_tag(t3)}",
+                    "rationale": f"O=0 verificado em todas as tags dos {fmt_pt(gf_total)} prompts ({AXIS_LABELS_PT[c1]} × {AXIS_LABELS_PT[c2]} × {AXIS_LABELS_PT[c3]} · E={exp}).",
+                }
+            )
+
+        # Fronteiras Criativas O=0 (motivos raros da cauda longa cruzados com os eixos do acervo)
+        raw_frontier_candidates: List[Tuple[float, str, int, str, str, int, str, str, int]] = []
+        for mf, fm in motif_counts_gf.items():
+            if fm < 12:
+                continue
+            for ax2 in ("environment", "fabric", "pose", "wardrobe"):
+                for t2, f2 in all_counts_gf[ax2].items():
+                    if f2 < 200:
                         continue
-                    exp = round((fe * fl * fa) / (max(1, gf_total) ** 2), 2)
-                    if exp < 4.0:
-                        continue
-                    dummy_blocks = {
-                        "environment_props": {"text": e_tag},
-                        "lighting_physics": {"text": l_tag},
-                        "camera_framing_occlusion": {"text": a_tag},
-                        "wardrobe_materials": {"text": ""},
-                        "body_mechanics_pose": {"text": ""},
-                    }
-                    coherent, _ = check_physical_and_empirical_coherence(
-                        dummy_blocks, conn=None, axis_tags={"environment": [e_tag], "lighting": [l_tag], "angle": [a_tag]}
+                    for ax3 in ("lighting", "angle"):
+                        for t3, f3 in all_counts_gf[ax3].items():
+                            if f3 < 200:
+                                continue
+                            if motif_tri_cooc_gf[(mf, ax2, t2, ax3, t3)] != 0:
+                                continue
+                            if not is_frontier_pair_coherent(mf, ax2, t2, ax3, t3):
+                                continue
+                            exp = round((fm * f2 * f3) / (max(1, gf_total) ** 2), 2)
+                            if exp < 0.45:
+                                continue
+                            raw_frontier_candidates.append((exp, mf, fm, ax2, t2, f2, ax3, t3, f3))
+
+        raw_frontier_candidates.sort(key=lambda x: x[0], reverse=True)
+        motif_quota: Counter = Counter()
+        frontier_pair_quota: Counter = Counter()
+        for exp, mf, fm, ax2, t2, f2, ax3, t3, f3 in raw_frontier_candidates:
+            if len(creative_frontier_gaps) >= 54:
+                break
+            if motif_quota[mf] >= 3 or frontier_pair_quota[(ax2, t2, ax3, t3)] >= 2:
+                continue
+            motif_quota[mf] += 1
+            frontier_pair_quota[(ax2, t2, ax3, t3)] += 1
+            catalyst = f"Motivo raro ({fm}x no acervo) colidindo com {human_tag(t2)} e {human_tag(t3)} para romper o padrão habitual."
+            creative_frontier_gaps.append(
+                {
+                    "id": f"gfnt:{mf}:{ax2}:{t2}:{ax3}:{t3}",
+                    "kind": "global_frontier_zero",
+                    "scope": f"Google Flow ({fmt_pt(gf_total)})",
+                    "axisA": "motif",
+                    "tagA": mf,
+                    "freqA": fm,
+                    "axisB": ax2,
+                    "tagB": t2,
+                    "freqB": f2,
+                    "axisC": ax3,
+                    "tagC": t3,
+                    "freqC": f3,
+                    "observedCount": 0,
+                    "expectedCount": exp,
+                    "lift": 0.0,
+                    "isCoherent": True,
+                    "isFrontier": True,
+                    "creativeCatalyst": catalyst,
+                    "donorAId": find_donor("motif", mf),
+                    "donorBId": find_donor(ax2, t2),
+                    "donorCId": find_donor(ax3, t3),
+                    "title": f"{human_tag(mf)} × {human_tag(t2)} × {human_tag(t3)}",
+                    "rationale": f"Fronteira Inédita (O=0 real em {fmt_pt(gf_total)} prompts · E={exp}). {catalyst}",
+                }
+            )
+
+        tested_bridges_list: List[Dict[str, Any]] = []
+        for bkey, entries in tested_bridges_raw.items():
+            entries_sorted = sorted(entries, key=lambda x: x[1], reverse=True)
+            thumbs: List[Dict[str, Any]] = []
+            projs_seen: List[str] = []
+            for iid, bt in entries_sorted:
+                it = item_by_id.get(iid)
+                if not it:
+                    continue
+                if it["project"] not in projs_seen:
+                    projs_seen.append(it["project"])
+                if len(thumbs) < 6:
+                    thumbs.append(
+                        {
+                            "id": it["id"],
+                            "title": it["title"],
+                            "project": it["project"],
+                            "sourceLib": it["sourceLib"],
+                            "thumbnailUrl": it["thumbnailUrl"],
+                            "btime": bt,
+                            "rarityTier": it["rarity"]["tier"],
+                            "rarityPercentile": it["rarity"]["percentile"],
+                            "maturityScore": it["maturity"]["score"],
+                        }
                     )
-                    if coherent:
-                        global_triad_gaps.append(
-                            {
-                                "id": f"g3d:{e_tag}:{l_tag}:{a_tag}",
-                                "kind": "global_3d_zero",
-                                "scope": "Google Flow (19.227)",
-                                "axisA": "environment",
-                                "tagA": e_tag,
-                                "freqA": fe,
-                                "axisB": "lighting",
-                                "tagB": l_tag,
-                                "freqB": fl,
-                                "axisC": "angle",
-                                "tagC": a_tag,
-                                "freqC": fa,
-                                "observedCount": 0,
-                                "expectedCount": exp,
-                                "lift": 0.0,
-                                "isCoherent": True,
-                                "donorAId": find_donor("environment", e_tag),
-                                "donorBId": find_donor("lighting", l_tag),
-                                "title": f"{human_tag(e_tag)} × {human_tag(l_tag)} × {human_tag(a_tag)}",
-                                "rationale": f"Zero ocorrências (O=0) nos 19.227 prompts de Google Flow, apesar de esperado estatístico E={exp}.",
-                            }
-                        )
+            tested_bridges_list.append(
+                {
+                    "bridgeKey": bkey,
+                    "tags": [p.strip() for p in bkey.split("×") if p.strip()],
+                    "count": len(entries),
+                    "latestBtime": entries_sorted[0][1] if entries_sorted else 0,
+                    "projects": projs_seen,
+                    "items": thumbs,
+                }
+            )
+        tested_bridges_list.sort(key=lambda x: x["latestBtime"], reverse=True)
 
         project_gaps.sort(key=lambda g: g["expectedCount"], reverse=True)
         global_triad_gaps.sort(key=lambda g: g["expectedCount"], reverse=True)
+        creative_frontier_gaps.sort(key=lambda g: g["expectedCount"], reverse=True)
         global_underexplored.sort(key=lambda g: (g["lift"], -g["expectedCount"]))
 
         # Manchas vazias (voidZones) no mapa de 22k pontos
@@ -1257,7 +1928,7 @@ def main() -> None:
                 cluster_pairs.append((math.hypot(cb["cx"] - ca["cx"], cb["cy"] - ca["cy"]), ca, cb))
         cluster_pairs.sort(key=lambda x: x[0])
 
-        gap_pool_voids = global_triad_gaps[:12] + project_gaps[:12]
+        gap_pool_voids = creative_frontier_gaps[:8] + global_triad_gaps[:8] + project_gaps[:8]
         used_voids: List[Tuple[float, float]] = []
         for _, ca, cb in cluster_pairs:
             if len(void_zones) >= 8:
@@ -1359,19 +2030,26 @@ def main() -> None:
             }
 
         same_skel_diff_subj: List[Dict[str, Any]] = []
-        c1 = [p for p in pair_scores if p[3] >= 0.78 and p[2] <= 0.44]
+        c1 = [p for p in pair_scores if p[3] >= 0.65 and p[2] <= 0.44]
         c1.sort(key=lambda p: (p[3] - p[2]), reverse=True)
-        seen1 = set()
-        for i, j, sem_s, str_s, div_s in c1:
+        # Sample evenly across c1 when there are > 30 candidates so scores aren't all saturated at 100%/0%
+        c1_non_zero = [p for p in c1 if p[2] > 0.01]
+        c1_pool = c1_non_zero if len(c1_non_zero) >= 30 else c1
+        step1 = max(1, len(c1_pool) // 90)
+        c1_sampled = c1_pool[::step1]
+        seen1: Dict[str, int] = {}
+        for i, j, sem_s, str_s, div_s in c1_sampled:
             if len(same_skel_diff_subj) >= 30:
                 break
-            if feat_pool[i]["id"] in seen1 and feat_pool[j]["id"] in seen1:
+            id_a, id_b = feat_pool[i]["id"], feat_pool[j]["id"]
+            if seen1.get(id_a, 0) >= 2 or seen1.get(id_b, 0) >= 2:
                 continue
-            seen1.update([feat_pool[i]["id"], feat_pool[j]["id"]])
+            seen1[id_a] = seen1.get(id_a, 0) + 1
+            seen1[id_b] = seen1.get(id_b, 0) + 1
             same_skel_diff_subj.append(
                 mk_pair(
                     i, j, sem_s, str_s, div_s, "same_skeleton_diff_subject",
-                    f"Mesmo molde estrutural ({feat_pool[i]['attributes']['estrutura']['kernelDialect']}, {int(str_s*100)}%) aplicado a cenas distintas ({int(sem_s*100)}% semântica).",
+                    f"Mesmo molde estrutural ({feat_pool[i]['attributes']['estrutura']['kernelDialect']}, {round(str_s*100)}%) aplicado a cenas distintas ({round(sem_s*100)}% semântica).",
                 )
             )
 
@@ -1408,9 +2086,9 @@ def main() -> None:
                 )
             )
 
-        # 7. Sumário de Projetos (7 de Google Flow + Gemini Kimi)
+        # 7. Sumário de Projetos (Google Flow dinâmico + Gemini Kimi)
         projects_data: List[Dict[str, Any]] = []
-        for proj_name in target_gf_projects + ["Gemini Kimi + Antigravity"]:
+        for proj_name in all_target_projects:
             p_tot = proj_totals[proj_name]
             p_src = "gemini_kimi" if proj_name == "Gemini Kimi + Antigravity" else "google_flow"
             p_subfolders = [{"name": sf, "count": cnt} for sf, cnt in proj_subfolders[proj_name].most_common(10)]
@@ -1460,11 +2138,13 @@ def main() -> None:
         for p in same_skel_diff_subj + same_subj_diff_skel + near_dups:
             featured_ids.add(p["idA"])
             featured_ids.add(p["idB"])
-        for g in project_gaps[:80] + global_triad_gaps[:60] + global_underexplored[:50]:
+        for g in project_gaps[:80] + global_triad_gaps[:60] + creative_frontier_gaps[:54] + global_underexplored[:50]:
             if g.get("donorAId"):
                 featured_ids.add(g["donorAId"])
             if g.get("donorBId"):
                 featured_ids.add(g["donorBId"])
+            if g.get("donorCId"):
+                featured_ids.add(g["donorCId"])
         for pr in projects_data:
             for eid in pr["exemplarIds"]:
                 featured_ids.add(eid)
@@ -1491,12 +2171,6 @@ def main() -> None:
                         "mode": "READ_ONLY",
                     },
                     {
-                        "name": "Gemini Kimi + Antigravity.library",
-                        "path": str(GEMINI_KIMI_IMAGES.parent),
-                        "count": gk_total,
-                        "mode": "READ_ONLY",
-                    },
-                    {
                         "name": "EmbeddingGemma-2 + CLIP (Int8)",
                         "path": str(GEMMA2_BIN),
                         "count": len(gemma_id_to_idx) + len(clip_id_to_idx),
@@ -1505,7 +2179,7 @@ def main() -> None:
                     {
                         "name": "PoseMatch (posematch_eagle.sqlite)",
                         "path": str(POSEMATCH_DB),
-                        "count": 15086 if POSEMATCH_DB.exists() else 0,
+                        "count": pm_items_count if POSEMATCH_DB.exists() else 0,
                         "mode": "READ_ONLY",
                     },
                 ],
@@ -1547,18 +2221,33 @@ def main() -> None:
             "gapsData": {
                 "matrices": matrices,
                 "projectGaps": project_gaps[:80],
-                "globalTriadGaps": global_triad_gaps[:60],
+                "globalTriadGaps": global_triad_gaps[:55],
+                "creativeFrontierGaps": creative_frontier_gaps[:54],
                 "globalUnderexplored": global_underexplored[:50],
+                "testedBridges": tested_bridges_list,
             },
             "projectsData": projects_data,
         }
 
-        OUTPUT_SUITE_JSON.write_text(json.dumps(suite_payload, ensure_ascii=False), encoding="utf-8")
+        synced_at_iso = datetime.now(timezone.utc).isoformat()
+        target_suite_path = (
+            DATA_DIR / "suite_google_flow.json.next" if args.stage_only else OUTPUT_SUITE_JSON
+        )
+        tmp_suite_path = DATA_DIR / "suite_google_flow.json.tmp"
+        tmp_suite_path.write_text(json.dumps(suite_payload, ensure_ascii=False), encoding="utf-8")
 
-        # 8. Grava todos os 22.282 prompts no SQLite com FTS5 e blobs de vetores 24d
+        # 8. Grava todos os prompts no SQLite com FTS5 e blobs de vetores 24d + sync_meta
+        target_db_path = (
+            DATA_DIR / "prompt_engine_v1.sqlite.next" if args.stage_only else OUTPUT_DB
+        )
         tmp_db = OUTPUT_DB.with_suffix(".sqlite.tmp")
-        if tmp_db.exists():
-            tmp_db.unlink()
+        for sidecar in (
+            tmp_db,
+            tmp_db.with_name(tmp_db.name + "-wal"),
+            tmp_db.with_name(tmp_db.name + "-shm"),
+        ):
+            if sidecar.exists():
+                sidecar.unlink()
         out_conn = sqlite3.connect(tmp_db)
         try:
             ocur = out_conn.cursor()
@@ -1620,6 +2309,18 @@ def main() -> None:
                     category TEXT NOT NULL,
                     PRIMARY KEY (prompt_id_a, prompt_id_b, category)
                 );
+
+                CREATE TABLE sync_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                CREATE TABLE gap_bridges (
+                    bridge_key TEXT NOT NULL,
+                    prompt_id TEXT NOT NULL,
+                    btime INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (bridge_key, prompt_id)
+                );
                 """
             )
 
@@ -1632,7 +2333,7 @@ def main() -> None:
                     t
                     for k in ("sujeito", "cenario", "luz", "camera", "textura_material", "estilo")
                     for t in it["attributes"][k]["tags"]
-                ) + " " + " ".join(it["eagleTags"])
+                ) + " " + " ".join(it["eagleTags"]) + " " + " ".join(row_motifs_by_id.get(it["id"], []))
 
                 prompt_rows_db.append(
                     (
@@ -1695,6 +2396,28 @@ def main() -> None:
                     "INSERT OR IGNORE INTO similarity_pairs VALUES (?,?,?,?,?,?)",
                     (p["idA"], p["idB"], p["semanticSim"], p["structuralSim"], p["divergenceScore"], p["category"]),
                 )
+            for bkey, entries in tested_bridges_raw.items():
+                for iid, bt in entries:
+                    ocur.execute(
+                        "INSERT OR IGNORE INTO gap_bridges VALUES (?,?,?)",
+                        (bkey, iid, bt),
+                    )
+
+            gf_sync = sync_stats.get("google_flow", {})
+            gk_sync = sync_stats.get("gemini_kimi", {})
+            new_parsed_total = int(gf_sync.get("new_or_modified", 0)) + int(gk_sync.get("new_or_modified", 0))
+            sync_meta_rows = [
+                ("synced_at", synced_at_iso),
+                ("gf_eagle_total", str(gf_sync.get("eagle_total", 0))),
+                ("gk_eagle_total", str(gk_sync.get("eagle_total", 0))),
+                ("gf_active_prompts", str(gf_total)),
+                ("gk_active_prompts", str(gk_total)),
+                ("gf_mtime_ts", str(gf_sync.get("lib_mtime_ts", 0))),
+                ("gk_mtime_ts", str(gk_sync.get("lib_mtime_ts", 0))),
+                ("new_parsed_count", str(new_parsed_total)),
+                ("total_corpus", str(n_total)),
+            ]
+            ocur.executemany("INSERT OR REPLACE INTO sync_meta VALUES (?, ?)", sync_meta_rows)
 
             ocur.executescript(
                 """
@@ -1707,23 +2430,55 @@ def main() -> None:
                 """
             )
             out_conn.commit()
+            out_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            out_conn.execute("PRAGMA journal_mode = DELETE")
+            out_conn.commit()
         finally:
             out_conn.close()
 
-        if OUTPUT_DB.exists():
-            OUTPUT_DB.unlink()
-        tmp_db.replace(OUTPUT_DB)
+        final_db_path = target_db_path
+        final_suite_path = target_suite_path
+        try:
+            for sidecar in (
+                target_db_path.with_name(target_db_path.name + "-wal"),
+                target_db_path.with_name(target_db_path.name + "-shm"),
+            ):
+                if sidecar.exists():
+                    sidecar.unlink()
+            if target_db_path.exists():
+                target_db_path.unlink()
+            tmp_db.replace(target_db_path)
 
-        print(f"[Ingest 22k] Concluído em {time.time()-t0:.1f}s!")
-        print(f"[Ingest 22k] SQLite FTS5: {OUTPUT_DB} ({OUTPUT_DB.stat().st_size // (1024*1024)} MB)")
-        print(f"[Ingest 22k] Suite JSON: {OUTPUT_SUITE_JSON} ({OUTPUT_SUITE_JSON.stat().st_size // 1024} KB)")
-        print(f"[Ingest 22k] Featured items: {len(featured_items)} | Clusters: {len(sem_clusters)} | Manchas vazias: {len(void_zones)}")
+            if target_suite_path.exists():
+                target_suite_path.unlink()
+            tmp_suite_path.replace(target_suite_path)
+        except PermissionError:
+            if args.stage_only:
+                raise
+            staged_db = DATA_DIR / "prompt_engine_v1.sqlite.next"
+            staged_suite = DATA_DIR / "suite_google_flow.json.next"
+            if staged_db.exists():
+                staged_db.unlink()
+            tmp_db.replace(staged_db)
+            if staged_suite.exists():
+                staged_suite.unlink()
+            tmp_suite_path.replace(staged_suite)
+            final_db_path = staged_db
+            final_suite_path = staged_suite
+            print(
+                "[Ingest] Servidor em execução mantém trava em data/prompt_engine_v1.sqlite; "
+                "saídas gravadas em .next para promoção automática pelo servidor."
+            )
+
+        print(f"[Ingest] Concluído em {time.time()-t0:.1f}s! (stage_only={args.stage_only})")
+        print(f"[Ingest] SQLite FTS5: {final_db_path} ({final_db_path.stat().st_size // (1024*1024)} MB)")
+        print(f"[Ingest] Suite JSON: {final_suite_path} ({final_suite_path.stat().st_size // 1024} KB)")
+        print(f"[Ingest] Featured items: {len(featured_items)} | Clusters: {len(sem_clusters)} | Manchas vazias: {len(void_zones)}")
         print(
-            f"[Ingest 22k] Pares -> Mesmo Esqueleto/Assunto Diff: {len(same_skel_diff_subj)} | "
+            f"[Ingest] Pares -> Mesmo Esqueleto/Assunto Diff: {len(same_skel_diff_subj)} | "
             f"Mesmo Assunto/Esqueleto Diff: {len(same_subj_diff_skel)} | Quase Duplicados: {len(near_dups)}"
         )
     finally:
-        conn_alfa.close()
         if conn_pm is not None:
             conn_pm.close()
 

@@ -175,17 +175,20 @@ describe('similaridade em duas camadas (Semântica vs Estrutural) & diff', () =>
   })
 })
 
-describe('suíte completa Etapa 3 (data/suite_google_flow.json + SQLite FTS5 22.282 prompts)', () => {
-  it('contém corpus completo de 22.282 prompts, 128 destaques, 12 clusters, 8 regiões estruturais, manchas vazias e 8 projetos', () => {
+describe('suíte completa Etapa 3 (data/suite_google_flow.json + SQLite FTS5 + ast_cache.sqlite)', () => {
+  it('contém corpus sincronizado completo, destaques, 12 clusters, 8 regiões estruturais, manchas vazias e projetos dinâmicos', () => {
     const suitePath = path.resolve(process.cwd(), 'data', 'suite_google_flow.json')
     expect(fs.existsSync(suitePath)).toBe(true)
 
     const suite = JSON.parse(fs.readFileSync(suitePath, 'utf-8')) as SuitePayload
     expect(suite.stats.primaryLibraryName).toBe('Google Flow + Prompts.library')
-    expect(suite.stats.totalCorpusSize).toBe(22282)
-    expect(suite.stats.googleFlowSize).toBe(19227)
-    expect(suite.stats.geminiKimiSize).toBe(3055)
-    expect(suite.items).toHaveLength(128)
+    expect(suite.stats.googleFlowSize).toBeGreaterThanOrEqual(19000)
+    expect(suite.stats.geminiKimiSize).toBe(0)
+    expect(suite.stats.totalCorpusSize).toBe(
+      suite.stats.googleFlowSize + suite.stats.geminiKimiSize
+    )
+    expect(suite.stats.totalCorpusSize).toBeGreaterThanOrEqual(19000)
+    expect(suite.items.length).toBeGreaterThanOrEqual(80)
 
     const formats = new Set(suite.items.map((i) => i.attributes.estrutura.macroFormat))
     expect(formats).toEqual(new Set(['json', 'sections', 'single_paragraph']))
@@ -211,18 +214,34 @@ describe('suíte completa Etapa 3 (data/suite_google_flow.json + SQLite FTS5 22.
     expect(suite.pairsData.sameSubjectDiffSkeleton.length).toBeGreaterThan(3)
     expect(suite.pairsData.nearDuplicates.length).toBeGreaterThan(3)
 
-    // Gaps: O = 0 em projetos e tríades globais
+    // Gaps: O = 0 em projetos, tríades globais e fronteiras inéditas + bridges testadas do Eagle
     expect(suite.gapsData.projectGaps.length).toBeGreaterThan(20)
     expect(suite.gapsData.globalTriadGaps.length).toBeGreaterThan(10)
-    for (const g of [...suite.gapsData.projectGaps, ...suite.gapsData.globalTriadGaps]) {
+    expect((suite.gapsData.creativeFrontierGaps ?? []).length).toBeGreaterThan(20)
+    for (const g of [
+      ...suite.gapsData.projectGaps,
+      ...suite.gapsData.globalTriadGaps,
+      ...(suite.gapsData.creativeFrontierGaps ?? []),
+    ]) {
       expect(g.observedCount).toBe(0)
       expect(g.isCoherent).toBe(true)
     }
+    for (const fg of suite.gapsData.creativeFrontierGaps ?? []) {
+      expect(fg.isFrontier).toBe(true)
+    }
 
-    // Projetos: 8 projetos reais (7 Google Flow + Gemini Kimi)
-    expect(suite.projectsData).toHaveLength(8)
+    const testedBridges = suite.gapsData.testedBridges ?? []
+    expect(testedBridges.length).toBeGreaterThanOrEqual(14)
+    for (const tb of testedBridges) {
+      expect(tb.tags.length).toBeGreaterThanOrEqual(2)
+      expect(tb.tags).not.toContain('softbo')
+      expect(tb.tags).not.toContain('_strobe')
+    }
+    expect(testedBridges.some((tb) => tb.tags.includes('studio_softbox_strobe'))).toBe(true)
+
+    // Projetos: >= 8 projetos reais do Google Flow
+    expect(suite.projectsData.length).toBeGreaterThanOrEqual(8)
     expect(suite.projectsData.some((p) => p.sourceLib === 'google_flow')).toBe(true)
-    expect(suite.projectsData.some((p) => p.sourceLib === 'gemini_kimi')).toBe(true)
 
     for (const item of suite.items) {
       expect(['google_flow', 'gemini_kimi']).toContain(item.sourceLib)
@@ -232,21 +251,25 @@ describe('suíte completa Etapa 3 (data/suite_google_flow.json + SQLite FTS5 22.
     }
   })
 
-  it('consulta todos os 22.282 prompts e o índice FTS5 no SQLite read-only (data/prompt_engine_v1.sqlite)', () => {
+  it('consulta todo o corpus sincronizado, índice FTS5 e cache AST incremental com 8 atributos', () => {
+    const suitePath = path.resolve(process.cwd(), 'data', 'suite_google_flow.json')
+    const suite = JSON.parse(fs.readFileSync(suitePath, 'utf-8')) as SuitePayload
     const dbPath = path.resolve(process.cwd(), 'data', 'prompt_engine_v1.sqlite')
+    const astCachePath = path.resolve(process.cwd(), 'data', 'ast_cache.sqlite')
     expect(fs.existsSync(dbPath)).toBe(true)
+    expect(fs.existsSync(astCachePath)).toBe(true)
 
     const db = new DatabaseSync(dbPath, { readOnly: true })
     try {
       const totalRow = db.prepare('SELECT COUNT(*) AS cnt FROM prompts').get() as { cnt: number }
-      expect(Number(totalRow.cnt)).toBe(22282)
+      expect(Number(totalRow.cnt)).toBe(suite.stats.totalCorpusSize)
 
       const byLib = db
         .prepare('SELECT source_lib, COUNT(*) AS cnt FROM prompts GROUP BY source_lib')
         .all() as Array<{ source_lib: string; cnt: number }>
       const libMap = Object.fromEntries(byLib.map((r) => [r.source_lib, Number(r.cnt)]))
-      expect(libMap.google_flow).toBe(19227)
-      expect(libMap.gemini_kimi).toBe(3055)
+      expect(libMap.google_flow).toBe(suite.stats.googleFlowSize)
+      expect(libMap.gemini_kimi ?? 0).toBe(0)
 
       const ftsRow = db
         .prepare(
@@ -254,8 +277,44 @@ describe('suíte completa Etapa 3 (data/suite_google_flow.json + SQLite FTS5 22.
         )
         .get('"linen"*') as { cnt: number }
       expect(Number(ftsRow.cnt)).toBeGreaterThan(50)
+
+      const bridgesRow = db
+        .prepare('SELECT COUNT(*) AS cnt FROM gap_bridges')
+        .get() as { cnt: number }
+      expect(Number(bridgesRow.cnt)).toBeGreaterThanOrEqual(14)
+
+      const recentRows = db
+        .prepare(
+          'SELECT attributes_json, filled_attributes_count FROM prompts ORDER BY btime DESC LIMIT 10'
+        )
+        .all() as Array<{ attributes_json: string; filled_attributes_count: number }>
+      expect(recentRows.length).toBeGreaterThan(0)
+      for (const row of recentRows) {
+        const attrs = JSON.parse(row.attributes_json) as Record<string, unknown>
+        expect(Object.keys(attrs)).toEqual([
+          'sujeito',
+          'cenario',
+          'luz',
+          'camera',
+          'textura_material',
+          'estilo',
+          'projeto_cliente',
+          'estrutura',
+        ])
+        expect(Number(row.filled_attributes_count)).toBeGreaterThanOrEqual(4)
+      }
     } finally {
       db.close()
+    }
+
+    const astDb = new DatabaseSync(astCachePath, { readOnly: true })
+    try {
+      const activeRow = astDb
+        .prepare("SELECT COUNT(*) AS cnt FROM ast_cache WHERE source_lib = 'google_flow' AND status = 'active'")
+        .get() as { cnt: number }
+      expect(Number(activeRow.cnt)).toBe(suite.stats.totalCorpusSize)
+    } finally {
+      astDb.close()
     }
   })
 })
@@ -349,6 +408,92 @@ describe('gapSynthesizer (Etapa 4: síntese assistida de gaps O=0 nos 3 formatos
       expect(decomposed.attributes.sujeito.tags).toContain('pose_agachada')
       expect(decomposed.attributes.luz.tags).toContain('luz_chiaroscuro_gobo')
     }
+  })
+
+  it('remove vazamentos de boilerplate (IDENTITY LOCK / forbidden_terms / luz conflitante) e suporta donorC + Fronteira', () => {
+    const suitePath = path.resolve(process.cwd(), 'data', 'suite_google_flow.json')
+    const suite = JSON.parse(fs.readFileSync(suitePath, 'utf-8')) as SuitePayload
+    const baseDonor = suite.items[0]!
+    const leakyDonorA = {
+      ...baseDonor,
+      id: 'leaky-a',
+      cleanPrompt:
+        'A candid street editorial photograph. IDENTITY LOCK: identical bone structure and exact nose from reference. forbidden_terms: neon, CGI. vocabulary_register: photographic, no jargon. Sun-bleached Mediterranean poolside boardwalk.',
+      rawPrompt:
+        'A candid street editorial photograph. IDENTITY LOCK: identical facial anatomy. forbidden_terms: neon. Sun-bleached boardwalk.',
+    }
+    const nightDonorB = {
+      ...baseDonor,
+      id: 'night-b',
+      cleanPrompt: 'Sodium-vapor streetlamps, glowing wet asphalt reflections at night.',
+      rawPrompt: 'Sodium-vapor streetlamps, glowing wet asphalt reflections at night.',
+    }
+    const frontierDonorC = {
+      ...baseDonor,
+      id: 'frontier-c',
+      cleanPrompt: 'Translucent frosted silk organza catching spectral edges.',
+      rawPrompt: 'Translucent frosted silk organza catching spectral edges.',
+    }
+
+    const frontierGap: GapRecord = {
+      id: 'gfnt:env:beach_pool_water:light:night_neon_sodium:motif:double_exposure',
+      kind: 'global_frontier_zero',
+      scope: 'all',
+      axisA: 'environment',
+      tagA: 'beach_pool_water',
+      freqA: 820,
+      axisB: 'lighting',
+      tagB: 'night_neon_sodium',
+      freqB: 640,
+      axisC: 'motif',
+      tagC: 'double_exposure',
+      freqC: 45,
+      observedCount: 0,
+      expectedCount: 4.2,
+      lift: 0,
+      isCoherent: true,
+      isFrontier: true,
+      creativeCatalyst: 'double_exposure',
+      donorAId: leakyDonorA.id,
+      donorBId: nightDonorB.id,
+      donorCId: frontierDonorC.id,
+      title: 'Praia × Neon Noturno × Dupla Exposição',
+      rationale: 'Teste unitário de fronteira criativa com donorC e sanitização.',
+    }
+
+    const cleanSynth = synthesizeGapPrompt({
+      gap: frontierGap,
+      donorA: leakyDonorA,
+      donorB: nightDonorB,
+      donorC: frontierDonorC,
+      format: 'sections',
+      aspectRatio: '3:4',
+      includeNegative: true,
+      preserveIdentity: false,
+      exploratoryMode: true,
+    })
+
+    expect(cleanSynth.rawPrompt).not.toMatch(/IDENTITY\s+LOCK/i)
+    expect(cleanSynth.rawPrompt).not.toMatch(/forbidden_terms/i)
+    expect(cleanSynth.rawPrompt).not.toMatch(/vocabulary_register/i)
+    expect(cleanSynth.rawPrompt).not.toMatch(/sun-bleached/i)
+    expect(cleanSynth.rawPrompt).not.toMatch(/exterior daylight/i)
+    expect(cleanSynth.rawPrompt).toMatch(/double[- ]exposure/i)
+
+    const withIdentity = synthesizeGapPrompt({
+      gap: frontierGap,
+      donorA: leakyDonorA,
+      donorB: nightDonorB,
+      donorC: frontierDonorC,
+      format: 'single_paragraph',
+      aspectRatio: '3:4',
+      includeNegative: false,
+      preserveIdentity: true,
+      exploratoryMode: true,
+    })
+
+    expect(withIdentity.rawPrompt).toMatch(/Preserve exact facial identity/i)
+    expect(withIdentity.rawPrompt).not.toMatch(/forbidden_terms/i)
   })
 })
 

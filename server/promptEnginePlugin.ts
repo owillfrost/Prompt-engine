@@ -1,4 +1,5 @@
 import type { Plugin } from 'vite'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -15,6 +16,7 @@ import type {
   AttributeTagStat,
   DecomposedAttributes,
   GapDraftRecord,
+  GapMissionStage,
   KernelDialect,
   MacroFormat,
   MapPointCompact,
@@ -24,7 +26,11 @@ import type {
   RarityBreakdown,
   RarityQuadrant,
   RarityTier,
+  SyncLibraryStatus,
+  SyncStatusResponse,
   TagDriftRecord,
+  TestedBridgeItemThumb,
+  TestedGapBridgeSummary,
   TimelineCohortRecord,
   TimelineInsightsResponse,
 } from '../src/types/promptEngine'
@@ -227,6 +233,38 @@ function resolveEagleThumbnailPath(sourceLib: string, itemId: string): string | 
   return null
 }
 
+function resolveEagleFullImagePath(sourceLib: string, itemId: string): string | null {
+  if (!SAFE_ID_RE.test(itemId)) return null
+  const roots =
+    sourceLib === 'gemini_kimi'
+      ? [GEMINI_KIMI_IMAGES, GOOGLE_FLOW_IMAGES]
+      : [GOOGLE_FLOW_IMAGES, GEMINI_KIMI_IMAGES]
+
+  for (const root of roots) {
+    const infoDir = path.join(root, `${itemId}.info`)
+    if (!fs.existsSync(infoDir)) continue
+    try {
+      const files = fs.readdirSync(infoDir)
+      let thumbFallback: string | null = null
+      for (const f of files) {
+        const low = f.toLowerCase()
+        if (low === 'metadata.json') continue
+        const ext = path.extname(low)
+        if (!IMAGE_EXTS.has(ext)) continue
+        if (THUMB_EXTS.some((tExt) => low.endsWith(tExt))) {
+          if (!thumbFallback) thumbFallback = path.join(infoDir, f)
+          continue
+        }
+        return path.join(infoDir, f)
+      }
+      if (thumbFallback) return thumbFallback
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
 function buildFtsMatchQuery(rawQuery: string): string | null {
   const tokens = rawQuery
     .toLowerCase()
@@ -286,22 +324,483 @@ function jaccardKeys(a: string[], b: string[]): number {
   return inter / (sa.size + sb.size - inter)
 }
 
+type LabEngineId =
+  | 'fdr_v2'
+  | 'fdr_v3_v4'
+  | 'fdr_v1_3'
+  | 'nano_banana_g3'
+  | 'nano_banana_g4'
+  | 'nano_banana_g6'
+  | 'studio_editorial'
+  | 'body_mechanics'
+  | 'json2vision'
+  | 'latente_v02'
+  | 'qwen_natural'
+
+interface LabEngineMeta {
+  clusterId: number
+  engineId: LabEngineId
+  label: string
+  family: string
+  color: string
+  description: string
+  cx: number
+  cy: number
+}
+
+const LAB_ENGINE_CATALOG: readonly LabEngineMeta[] = [
+  {
+    clusterId: 1,
+    engineId: 'fdr_v2',
+    label: 'Power FDR v2.x',
+    family: 'FDR',
+    color: '#38bdf8',
+    description: 'Schema fdr_version 2.x · camera_technical & storage_context (anti-bokeh UGC)',
+    cx: -720,
+    cy: -480,
+  },
+  {
+    clusterId: 2,
+    engineId: 'fdr_v3_v4',
+    label: 'FDR v3 / v4',
+    family: 'FDR',
+    color: '#0ea5e9',
+    description: 'Evolução FDR v3/v4 estruturada com controle de dispositivo e exposição',
+    cx: -1260,
+    cy: -240,
+  },
+  {
+    clusterId: 3,
+    engineId: 'fdr_v1_3',
+    label: 'FDR v1.3 Direct',
+    family: 'FDR',
+    color: '#7dd3fc',
+    description: 'Injeção direta Device-First [shot_type] (seed inicial FDR)',
+    cx: -1280,
+    cy: -680,
+  },
+  {
+    clusterId: 4,
+    engineId: 'nano_banana_g3',
+    label: 'Nano Banana G3',
+    family: 'Architect',
+    color: '#f59e0b',
+    description: 'Architect v3.0 — formato misto (JSON/narrativa) e categorias A/B/C',
+    cx: 260,
+    cy: -620,
+  },
+  {
+    clusterId: 5,
+    engineId: 'nano_banana_g4',
+    label: 'Nano Banana G4',
+    family: 'Architect',
+    color: '#fb923c',
+    description: 'Architect v4.0 Editorial — 5 categorias estruturais e bloco color_grade',
+    cx: 720,
+    cy: -520,
+  },
+  {
+    clusterId: 6,
+    engineId: 'nano_banana_g6',
+    label: 'Nano Banana G5 / G6',
+    family: 'Architect',
+    color: '#fbbf24',
+    description: 'Architect v5/v6 — 7 linhagens, vocabulary_register e câmera vs profile_or_lut',
+    cx: 1140,
+    cy: -420,
+  },
+  {
+    clusterId: 7,
+    engineId: 'studio_editorial',
+    label: 'Studio Editorial',
+    family: 'Editorial',
+    color: '#f472b6',
+    description: 'Sistema próprio Single Shot / Lookbook / Ciclorama e Alta Moda',
+    cx: -920,
+    cy: 340,
+  },
+  {
+    clusterId: 8,
+    engineId: 'body_mechanics',
+    label: 'Body Mechanics',
+    family: 'Biomecânica',
+    color: '#34d399',
+    description: 'Sistema próprio Candid Capture, anatomia independente e Identity Lock',
+    cx: -340,
+    cy: 460,
+  },
+  {
+    clusterId: 9,
+    engineId: 'json2vision',
+    label: 'JSON2VISION',
+    family: 'Meta-Schema',
+    color: '#a78bfa',
+    description: 'Vision-to-JSON: PortraitStruct v1 (retratos) e VisionStruct v1 (cenas)',
+    cx: 460,
+    cy: 260,
+  },
+  {
+    clusterId: 10,
+    engineId: 'latente_v02',
+    label: 'Latente v0.2',
+    family: 'Latente',
+    color: '#c084fc',
+    description: 'Kernel latente_version com signature_rules e color_logic',
+    cx: 980,
+    cy: 140,
+  },
+  {
+    clusterId: 11,
+    engineId: 'qwen_natural',
+    label: 'Prosa Natural',
+    family: 'Prosa',
+    color: '#94a3b8',
+    description: 'Linguagem natural contínua / prosa livre sem schema estruturado',
+    cx: 920,
+    cy: 580,
+  },
+]
+
+const LAB_ENGINE_BY_ID = new Map<LabEngineId, LabEngineMeta>(
+  LAB_ENGINE_CATALOG.map((meta) => [meta.engineId, meta])
+)
+
+function hashUnit(seed: string): number {
+  let h = 2166136261
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0) / 4294967296
+}
+
+/** Classifica um prompt em sua engine/construtor de origem sem alterar dados persistidos. */
+function classifyPromptEngine(
+  cleanPrompt: string,
+  tagsJson: string,
+  macroFormat: string,
+  kernelDialect: string
+): LabEngineId {
+  const low = cleanPrompt.toLowerCase()
+  const tags = tagsJson.toLowerCase()
+  const textAndTags = `${low} ${tags}`
+
+  if (/latente_version|signature_rules|color_logic/.test(low) || kernelDialect === 'latente_v02') {
+    return 'latente_v02'
+  }
+  if (
+    macroFormat === 'json' &&
+    /vocabulary_register|required_terms|forbidden_terms|profile_or_lut|visual_context/.test(low)
+  ) {
+    return 'nano_banana_g6'
+  }
+  if (macroFormat === 'json' && /color_grade/.test(low) && /camera/.test(low)) {
+    return 'nano_banana_g4'
+  }
+  // Studio Editorial e Body Mechanics são sistemas completamente distintos no acervo.
+  if (
+    /studio editorial|gradient sky backdrop|ciclorama|cyclorama|\binput a\b|\bstep\s*[1-4]\b/.test(low) &&
+    !/--- candid mode ---/.test(low)
+  ) {
+    return 'studio_editorial'
+  }
+  if (
+    /body mechanics|anatomia independente|weight_distribution|torso[- ]pelvis|candid mode|candid iphone|\[identity lock\]/.test(
+      low
+    ) ||
+    kernelDialect === 'body_mechanics_12block'
+  ) {
+    return 'body_mechanics'
+  }
+  if (/i am nano banan|nano_banana|nano banan/.test(low)) {
+    return 'nano_banana_g3'
+  }
+  if (/json2vision|visionstruct|portraitstruct/.test(textAndTags)) {
+    return 'json2vision'
+  }
+  if (/\[shot_type\]|fdr v1\.3|fdr_direct/.test(low) || kernelDialect === 'fdr_direct') {
+    return 'fdr_v1_3'
+  }
+  if (/fdr_version[^0-9]{1,8}[34]|\bfdr\s*[34](?:\.\d)?\b/.test(low)) {
+    return 'fdr_v3_v4'
+  }
+  if (/fdr_version[^0-9]{1,8}2|camera_technical|storage_context/.test(low)) {
+    return 'fdr_v2'
+  }
+  if (macroFormat === 'json') {
+    return kernelDialect === 'nano_banana_g6' ? 'nano_banana_g4' : 'fdr_v2'
+  }
+  if (
+    macroFormat === 'sections' ||
+    kernelDialect === 'studio_editorial_v5' ||
+    kernelDialect === 'numbered_sections'
+  ) {
+    return 'studio_editorial'
+  }
+  return 'qwen_natural'
+}
+
 export function promptEnginePlugin(): Plugin {
   const projectRoot = process.cwd()
   const suiteJsonPath = path.join(projectRoot, 'data', 'suite_google_flow.json')
   const sampleJsonPath = path.join(projectRoot, 'data', 'sample_50_prompts.json')
   const dbPath = path.join(projectRoot, 'data', 'prompt_engine_v1.sqlite')
+  const astCachePath = path.join(projectRoot, 'data', 'ast_cache.sqlite')
   const draftsJsonPath = path.join(projectRoot, 'data', 'gap_drafts.json')
 
   let db: DatabaseSync | null = null
   let dbMtimeMs = 0
+  let idleCloseTimer: ReturnType<typeof setTimeout> | null = null
+  let cachedLastSyncedAt: string | null = null
   let cachedPoints: MapPointCompact[] = []
   let cachedVecs = new Float32Array(0)
   let cachedIdToIdx = new Map<string, number>()
   let cachedSortedRarityScores: number[] = []
   let cachedPeriodById = new Map<string, string>()
   let cachedTimelineInsights: TimelineInsightsResponse | null = null
+  let cachedEngineMapById = new Map<string, LabEngineId>()
+  let cachedEngineFolderById = new Map<string, string>()
   const tagCountCache = new Map<string, number>()
+
+  // Caches leves de leitura de staleness (invalidados por mtimeMs)
+  const eagleMtimeCache = new Map<string, { fileMtimeMs: number; map: Map<string, number> }>()
+  let astCacheSnapshotMtime = 0
+  let astCacheSnapshot = new Map<string, Map<string, { mtimeMs: number; status: string }>>()
+
+  // Estado de sincronização em background
+  let syncState: 'idle' | 'running' | 'error' = 'idle'
+  let syncRunningSince: string | null = null
+  let syncLogLines: string[] = []
+  let syncLastError: string | null = null
+  let syncLastDurationMs: number | null = null
+  let activeSyncProc: ChildProcess | null = null
+
+  function closeDbHandle(): void {
+    if (idleCloseTimer) {
+      clearTimeout(idleCloseTimer)
+      idleCloseTimer = null
+    }
+    if (db) {
+      try {
+        db.close()
+      } catch {
+        // ignore
+      }
+      db = null
+    }
+  }
+
+  function scheduleIdleDbClose(): void {
+    if (idleCloseTimer) clearTimeout(idleCloseTimer)
+    idleCloseTimer = setTimeout(() => {
+      idleCloseTimer = null
+      closeDbHandle()
+    }, 8000)
+    idleCloseTimer.unref?.()
+  }
+
+  function readEagleMtimeSnapshot(mtimePath: string): { fileMtimeMs: number | null; map: Map<string, number> } {
+    try {
+      if (!fs.existsSync(mtimePath)) return { fileMtimeMs: null, map: new Map() }
+      const stat = fs.statSync(mtimePath)
+      const cached = eagleMtimeCache.get(mtimePath)
+      if (cached && cached.fileMtimeMs === stat.mtimeMs) {
+        return cached
+      }
+      const parsed = JSON.parse(fs.readFileSync(mtimePath, 'utf-8')) as Record<string, unknown>
+      const map = new Map<string, number>()
+      for (const [k, v] of Object.entries(parsed)) {
+        if (k === 'all') continue
+        const num = Number(v)
+        if (Number.isFinite(num)) map.set(k, num)
+      }
+      const next = { fileMtimeMs: stat.mtimeMs, map }
+      eagleMtimeCache.set(mtimePath, next)
+      return next
+    } catch {
+      return { fileMtimeMs: null, map: new Map() }
+    }
+  }
+
+  function readAstCacheSnapshot(): Map<string, Map<string, { mtimeMs: number; status: string }>> {
+    if (syncState === 'running') {
+      return astCacheSnapshot
+    }
+    try {
+      if (!fs.existsSync(astCachePath)) {
+        astCacheSnapshotMtime = 0
+        astCacheSnapshot = new Map()
+        return astCacheSnapshot
+      }
+      const stat = fs.statSync(astCachePath)
+      if (stat.mtimeMs === astCacheSnapshotMtime && astCacheSnapshot.size > 0) {
+        return astCacheSnapshot
+      }
+      const next = new Map<string, Map<string, { mtimeMs: number; status: string }>>()
+      const cacheDb = new DatabaseSync(astCachePath, { readOnly: true })
+      try {
+        const rows = cacheDb
+          .prepare('SELECT source_lib, item_id, mtime_ms, status FROM ast_cache')
+          .all() as Array<{ source_lib: string; item_id: string; mtime_ms: number; status: string }>
+        for (const r of rows) {
+          let libMap = next.get(r.source_lib)
+          if (!libMap) {
+            libMap = new Map()
+            next.set(r.source_lib, libMap)
+          }
+          libMap.set(r.item_id, { mtimeMs: Number(r.mtime_ms || 0), status: String(r.status || 'active') })
+        }
+      } finally {
+        cacheDb.close()
+      }
+      astCacheSnapshotMtime = stat.mtimeMs
+      astCacheSnapshot = next
+      return astCacheSnapshot
+    } catch {
+      return astCacheSnapshot
+    }
+  }
+
+  async function replaceFileWithRetry(src: string, dest: string): Promise<void> {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        await fsp.rename(src, dest)
+        return
+      } catch (err) {
+        const code = (err as { code?: string })?.code
+        if (attempt < 5 && (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES')) {
+          await new Promise((r) => setTimeout(r, 120 * (attempt + 1)))
+          continue
+        }
+        throw err
+      }
+    }
+  }
+
+  function promoteStagedIfPresent(): void {
+    if (syncState === 'running') return
+    const stagedDb = `${dbPath}.next`
+    const stagedSuite = `${suiteJsonPath}.next`
+    if (!fs.existsSync(stagedDb) || !fs.existsSync(stagedSuite)) return
+    try {
+      closeDbHandle()
+      for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) {
+        if (fs.existsSync(sidecar)) {
+          try {
+            fs.unlinkSync(sidecar)
+          } catch {
+            // ignore locked or missing sidecar
+          }
+        }
+      }
+      fs.renameSync(stagedDb, dbPath)
+      fs.renameSync(stagedSuite, suiteJsonPath)
+      dbMtimeMs = 0
+      astCacheSnapshotMtime = 0
+      eagleMtimeCache.clear()
+      thumbnailRamCache.clear()
+      cachedTimelineInsights = null
+      cachedEngineMapById.clear()
+      tagCountCache.clear()
+    } catch {
+      // ignore transient rename failure; retry on next request/startup
+    }
+  }
+
+  function buildSyncStatus(): SyncStatusResponse {
+    promoteStagedIfPresent()
+    if (cachedPoints.length === 0 && fs.existsSync(dbPath)) {
+      ensureDbLoaded()
+    }
+
+    const astByLib = readAstCacheSnapshot()
+    const indexedCounts = { google_flow: 0, gemini_kimi: 0 }
+    const indexedIdsByLib = { google_flow: new Set<string>(), gemini_kimi: new Set<string>() }
+    for (const pt of cachedPoints) {
+      if (pt.sourceLib === 'gemini_kimi') {
+        indexedCounts.gemini_kimi++
+        indexedIdsByLib.gemini_kimi.add(pt.id)
+      } else {
+        indexedCounts.google_flow++
+        indexedIdsByLib.google_flow.add(pt.id)
+      }
+    }
+
+    const libsMeta: Array<{
+      sourceLib: 'google_flow' | 'gemini_kimi'
+      name: string
+      mtimePath: string
+    }> = [
+      { sourceLib: 'google_flow', name: 'Google Flow + Prompts.library', mtimePath: GOOGLE_FLOW_MTIME },
+    ]
+
+    const libraries: SyncLibraryStatus[] = libsMeta.map((lib) => {
+      const eagleSnap = readEagleMtimeSnapshot(lib.mtimePath)
+      const astMap = astByLib.get(lib.sourceLib)
+      let pendingNewCount = 0
+      let pendingModifiedCount = 0
+      let pendingRemovedCount = 0
+
+      if (astMap && astMap.size > 0) {
+        for (const [id, ts] of eagleSnap.map.entries()) {
+          const entry = astMap.get(id)
+          if (!entry) {
+            pendingNewCount++
+          } else if (entry.mtimeMs !== ts) {
+            pendingModifiedCount++
+          }
+        }
+        for (const [id, entry] of astMap.entries()) {
+          if (entry.status === 'active' && !eagleSnap.map.has(id)) {
+            pendingRemovedCount++
+          }
+        }
+      } else if (eagleSnap.map.size > 0) {
+        const indexedSet = indexedIdsByLib[lib.sourceLib]
+        for (const [id, ts] of eagleSnap.map.entries()) {
+          if (!indexedSet.has(id) && ts > dbMtimeMs) {
+            pendingNewCount++
+          } else if (indexedSet.has(id) && ts > dbMtimeMs) {
+            pendingModifiedCount++
+          }
+        }
+        for (const id of indexedSet) {
+          if (!eagleSnap.map.has(id)) {
+            pendingRemovedCount++
+          }
+        }
+      }
+
+      return {
+        sourceLib: lib.sourceLib,
+        name: lib.name,
+        eagleItemsCount: eagleSnap.map.size,
+        indexedPromptsCount: indexedCounts[lib.sourceLib],
+        pendingNewCount,
+        pendingModifiedCount,
+        pendingRemovedCount,
+        eagleUpdatedAt: eagleSnap.fileMtimeMs ? new Date(eagleSnap.fileMtimeMs).toISOString() : null,
+      }
+    })
+
+    const totalPendingChanges = libraries.reduce(
+      (sum, l) => sum + l.pendingNewCount + l.pendingModifiedCount + l.pendingRemovedCount,
+      0
+    )
+
+    return {
+      state: syncState,
+      inSync: totalPendingChanges === 0,
+      totalPendingChanges,
+      lastSyncedAt: cachedLastSyncedAt || (dbMtimeMs > 0 ? new Date(dbMtimeMs).toISOString() : null),
+      indexedTotalPrompts: cachedPoints.length,
+      libraries,
+      runningSince: syncRunningSince,
+      lastLogLines: [...syncLogLines],
+      lastError: syncLastError,
+      lastDurationMs: syncLastDurationMs,
+    }
+  }
 
   async function readGapDrafts(): Promise<GapDraftRecord[]> {
     try {
@@ -373,6 +872,117 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
     return !scope.startsWith('Google Flow') && !scope.startsWith('Global')
   }
 
+  const MOTIF_FTS_TERMS: Record<string, string> = {
+    prism_refraction: 'prism',
+    double_exposure: '"double exposure"',
+    long_exposure: '"long exposure"',
+    projector_light: 'projector',
+    stained_glass: '"stained glass"',
+    candlelight_amber: 'candlelight OR candle',
+    fisheye_optics: 'fisheye',
+    monochrome_noir: 'monochrome OR "black and white"',
+    polaroid_patina: 'polaroid',
+    rain_wet_glass: 'rain OR raindrops',
+    fog_mist_veil: 'fog OR mist',
+    smoke_haze: 'smoke OR haze',
+    snow_frost: 'snow OR frost',
+    underwater_weightless: 'underwater OR submerged',
+    library_stacks: 'library',
+    subway_transit: 'subway',
+    elevator_box: 'elevator',
+    supermarket_aisle: 'supermarket',
+    theater_stage: 'theater OR theatre',
+    arcade_neon: 'arcade',
+    greenhouse_glass: 'greenhouse',
+    stairwell_echo: 'stairwell',
+    feathers_plume: 'feathers OR feather',
+    sequins_sparkle: 'sequins OR sequin',
+    surreal_dream: 'surreal',
+    shadow_play_gobo: '"shadow play" OR "venetian blind"',
+    laundromat_glow: 'laundromat',
+  }
+
+  function buildTagFtsClause(rawTag: string): string | null {
+    const clean = sanitizeCanonicalTag(rawTag)
+    if (!clean) return null
+    const mapped = DECOMPOSER_TO_SQLITE_TAG[clean] || clean
+    const motifTerm = MOTIF_FTS_TERMS[clean]
+    if (motifTerm) {
+      return `(tags_text : "${mapped}" OR clean_prompt : (${motifTerm}))`
+    }
+    return `tags_text : "${mapped}"`
+  }
+
+  function inferSlotKeyForTag(rawTag: string): keyof PromptItem['attributes'] {
+    if (/^(standing_|mirror_|seated_|reclining_|crouching_|walking_|leaning_|counter_|action_|hands_)/.test(rawTag)) {
+      return 'sujeito'
+    }
+    if (/^(frontal_|arm_|high_angle|low_angle|three_quarter|dorsal_|dutch_|close_up|three_plane|wide_angle|telephoto_)/.test(rawTag)) {
+      return 'camera'
+    }
+    if (/^(indoor_|window_|harsh_|studio_softbox|golden_|direct_flash|night_|chiaroscuro_)/.test(rawTag)) {
+      return 'luz'
+    }
+    if (/^(bedroom_|bathroom_|living_|studio_seamless|beach_|urban_|cafe_|car_|brutalist_|botanical_)/.test(rawTag)) {
+      return 'cenario'
+    }
+    if (/^(cotton_|denim_canvas|silk_|wool_|linen_|leather_|velvet_|lace_|technical_|tank_top|t_shirt|hoodie|blazer|dress|bikini|knitwear|tailored|denim_jeans|utilitarian|accessories)/.test(rawTag)) {
+      return 'textura_material'
+    }
+    return 'estilo'
+  }
+
+  function scoreDonorSpecificity(item: PromptItem, rawTag: string): number {
+    const slotKey = inferSlotKeyForTag(rawTag)
+    const slot = item.attributes[slotKey]
+    const tagsLen = slot && 'tags' in slot ? slot.tags.length : 1
+    const rawLen = item.rawPrompt.length
+    const specificity = 22 / Math.max(1, tagsLen)
+    const lengthScore = rawLen >= 300 && rawLen <= 3800 ? 10 : rawLen > 5200 ? -12 : 2
+    const boilerplatePen = /^(?:#prompt\s+\d+|Create image:\s*use the attached|STUDIO EDITORIAL)/i.test(
+      item.cleanPrompt.trim()
+    )
+      ? -14
+      : 0
+    return specificity + lengthScore + boilerplatePen + item.maturity.score * 0.24 + item.rarity.percentile * 0.1
+  }
+
+  function pickDiverseDonors(candidates: PromptItem[], rawTag: string, limit: number): PromptItem[] {
+    const scored = candidates
+      .map((item) => ({ item, score: scoreDonorSpecificity(item, rawTag) }))
+      .sort((a, b) => b.score - a.score)
+
+    const out: PromptItem[] = []
+    const seenIds = new Set<string>()
+    const seenTemplates = new Set<string>()
+    const projectCounts = new Map<string, number>()
+
+    // Pass 1: prioriza variedade de projetos e esqueletos únicos (evita 5 clones do mesmo template)
+    for (const { item } of scored) {
+      if (out.length >= limit) break
+      if (seenIds.has(item.id)) continue
+      const tplKey = `${item.project}:${item.attributes.estrutura.skeletonSignature}:${item.cleanPrompt.slice(0, 64).toLowerCase()}`
+      if (seenTemplates.has(tplKey)) continue
+      const pCnt = projectCounts.get(item.project) || 0
+      if (pCnt >= 2 && scored.length > limit * 2) continue
+      seenIds.add(item.id)
+      seenTemplates.add(tplKey)
+      projectCounts.set(item.project, pCnt + 1)
+      out.push(item)
+    }
+
+    // Pass 2: preenche restantes se faltou variedade
+    if (out.length < limit) {
+      for (const { item } of scored) {
+        if (out.length >= limit) break
+        if (seenIds.has(item.id)) continue
+        seenIds.add(item.id)
+        out.push(item)
+      }
+    }
+    return out
+  }
+
   function findDonorsForTag(
     database: DatabaseSync,
     rawTag: string,
@@ -381,10 +991,13 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
   ): PromptItem[] {
     const clean = sanitizeCanonicalTag(rawTag)
     if (!clean) return []
-    const mapped = DECOMPOSER_TO_SQLITE_TAG[clean] || clean
-    const matchExpr = `tags_text : "${mapped}"`
-    const out: PromptItem[] = []
+    const matchExpr = buildTagFtsClause(clean)
+    if (!matchExpr) return []
+
+    const scopedItems: PromptItem[] = []
+    const globalItems: PromptItem[] = []
     const seen = new Set<string>()
+    const fetchWindow = Math.max(48, limit * 8)
 
     try {
       if (isNamedProjectScope(scope)) {
@@ -396,17 +1009,17 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
              ORDER BY prompts.maturity_score DESC, prompts.rarity_percentile DESC
              LIMIT ?`
           )
-          .all(matchExpr, scope, limit) as Array<Record<string, unknown>>
+          .all(matchExpr, scope, fetchWindow) as Array<Record<string, unknown>>
         for (const r of scopedRows) {
           const item = hydratePromptRow(r)
           if (!seen.has(item.id)) {
             seen.add(item.id)
-            out.push(item)
+            scopedItems.push(item)
           }
         }
       }
 
-      if (out.length < limit) {
+      if (scopedItems.length < limit) {
         const globalRows = database
           .prepare(
             `SELECT prompts.* FROM prompts
@@ -415,40 +1028,164 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
              ORDER BY prompts.maturity_score DESC, prompts.rarity_percentile DESC
              LIMIT ?`
           )
-          .all(matchExpr, limit + out.length) as Array<Record<string, unknown>>
+          .all(matchExpr, fetchWindow) as Array<Record<string, unknown>>
         for (const r of globalRows) {
           const item = hydratePromptRow(r)
           if (!seen.has(item.id)) {
             seen.add(item.id)
-            out.push(item)
-            if (out.length >= limit) break
+            globalItems.push(item)
           }
         }
       }
     } catch {
-      return out
+      return [...pickDiverseDonors(scopedItems, clean, limit)]
     }
-    return out
+
+    const pickedScoped = pickDiverseDonors(scopedItems, clean, limit)
+    if (pickedScoped.length >= limit) return pickedScoped
+    const remaining = limit - pickedScoped.length
+    return [...pickedScoped, ...pickDiverseDonors(globalItems, clean, remaining)]
+  }
+
+  function normalizeBridgeKey(rawBridge: string): string {
+    return rawBridge
+      .split(/\s*×\s*|\s+[xX]\s+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .join(' × ')
+  }
+
+  function readTestedBridgesFromDb(database: DatabaseSync): {
+    testedBridges: TestedGapBridgeSummary[]
+    totalTestedPrompts: number
+  } {
+    const grouped = new Map<
+      string,
+      {
+        count: number
+        latestBtime: number
+        projects: Set<string>
+        items: TestedBridgeItemThumb[]
+      }
+    >()
+    let totalTestedPrompts = 0
+
+    try {
+      const hasTable = Boolean(
+        database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='gap_bridges'").get()
+      )
+
+      const rows = hasTable
+        ? (database
+            .prepare(
+              `SELECT gb.bridge_key AS bridge_key, p.id, p.title, p.project_name, p.source_lib,
+                      p.thumbnail_url, p.btime, p.rarity_tier, p.rarity_percentile, p.maturity_score
+               FROM gap_bridges gb
+               JOIN prompts p ON p.id = gb.prompt_id
+               ORDER BY p.btime DESC`
+            )
+            .all() as Array<Record<string, unknown>>)
+        : (database
+            .prepare(
+              `SELECT id, title, project_name, source_lib, thumbnail_url, btime,
+                      rarity_tier, rarity_percentile, maturity_score, raw_prompt
+               FROM prompts
+               WHERE raw_prompt LIKE '%"gap_bridge"%'
+               ORDER BY btime DESC`
+            )
+            .all() as Array<Record<string, unknown>>)
+
+      for (const r of rows) {
+        let bridgeKey = typeof r.bridge_key === 'string' ? r.bridge_key : ''
+        if (!bridgeKey && typeof r.raw_prompt === 'string') {
+          const m = /"gap_bridge"\s*:\s*"([^"]+)"/i.exec(r.raw_prompt)
+          if (m) bridgeKey = normalizeBridgeKey(m[1])
+        }
+        if (!bridgeKey) continue
+
+        totalTestedPrompts++
+        let entry = grouped.get(bridgeKey)
+        if (!entry) {
+          entry = { count: 0, latestBtime: 0, projects: new Set(), items: [] }
+          grouped.set(bridgeKey, entry)
+        }
+        const btime = Number(r.btime || 0)
+        const project = String(r.project_name || 'Sem Projeto')
+        entry.count++
+        if (btime > entry.latestBtime) entry.latestBtime = btime
+        entry.projects.add(project)
+        if (entry.items.length < 6) {
+          const sourceLib = r.source_lib === 'gemini_kimi' ? 'gemini_kimi' : 'google_flow'
+          const id = String(r.id)
+          entry.items.push({
+            id,
+            title: String(r.title || id),
+            project,
+            sourceLib,
+            thumbnailUrl: r.thumbnail_url ? String(r.thumbnail_url) : `/api/thumbnail/${sourceLib}/${id}`,
+            btime,
+            rarityTier: String(r.rarity_tier || 'B') as RarityTier,
+            rarityPercentile: Number(r.rarity_percentile || 50),
+            maturityScore: Number(r.maturity_score || 50),
+          })
+        }
+      }
+    } catch {
+      return { testedBridges: [], totalTestedPrompts: 0 }
+    }
+
+    const testedBridges: TestedGapBridgeSummary[] = Array.from(grouped.entries())
+      .map(([bridgeKey, v]) => ({
+        bridgeKey,
+        tags: bridgeKey.split('×').map((s) => s.trim()).filter(Boolean),
+        count: v.count,
+        latestBtime: v.latestBtime,
+        projects: Array.from(v.projects),
+        items: v.items,
+      }))
+      .sort((a, b) => b.latestBtime - a.latestBtime)
+
+    return { testedBridges, totalTestedPrompts }
   }
 
   function ensureDbLoaded(): DatabaseSync | null {
+    promoteStagedIfPresent()
     if (!fs.existsSync(dbPath)) return null
     const stat = fs.statSync(dbPath)
-    if (db && stat.mtimeMs === dbMtimeMs) return db
+    scheduleIdleDbClose()
 
-    if (db) {
-      try {
-        db.close()
-      } catch {
-        // ignore
-      }
-      db = null
+    if (db && stat.mtimeMs === dbMtimeMs) return db
+    if (!db && stat.mtimeMs === dbMtimeMs && cachedPoints.length > 0) {
+      db = new DatabaseSync(dbPath, { readOnly: true })
+      return db
     }
+
+    closeDbHandle()
 
     db = new DatabaseSync(dbPath, { readOnly: true })
     dbMtimeMs = stat.mtimeMs
     tagCountCache.clear()
     cachedTimelineInsights = null
+    cachedEngineMapById.clear()
+    cachedEngineFolderById.clear()
+    cachedLastSyncedAt = new Date(stat.mtimeMs).toISOString()
+
+    try {
+      const hasSyncMeta = Boolean(
+        db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sync_meta'").get()
+      )
+      if (hasSyncMeta) {
+        const metaRow = db.prepare("SELECT value FROM sync_meta WHERE key = 'synced_at'").get() as
+          | { value?: string }
+          | undefined
+        if (metaRow?.value) {
+          cachedLastSyncedAt = String(metaRow.value)
+        }
+      }
+    } catch {
+      // ignore missing sync_meta
+    }
+
     const mtimeMap = loadMtimeLookup()
 
     // Carrega pontos compactos + blobs sem_vec (24 floats) + scores ordenados de raridade + safras em memória
@@ -514,13 +1251,124 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
   return {
     name: 'prompt-engine-v1-api',
     configureServer(server) {
+      promoteStagedIfPresent()
+      server.httpServer?.once('close', () => {
+        closeDbHandle()
+        if (activeSyncProc && !activeSyncProc.killed) {
+          activeSyncProc.kill()
+        }
+      })
+
       server.middlewares.use(async (req, res, next) => {
         const rawUrl = req.url || ''
         const [url, qs] = rawUrl.split('?')
         const params = new URLSearchParams(qs || '')
 
+        if (req.method === 'GET' && url === '/api/sync-status') {
+          try {
+            sendJson(res, 200, buildSyncStatus())
+          } catch (err) {
+            sendJson(res, 500, { error: String(err) })
+          }
+          return
+        }
+
+        if (req.method === 'POST' && url === '/api/sync') {
+          if (syncState === 'running') {
+            sendJson(res, 202, buildSyncStatus())
+            return
+          }
+          const tStart = Date.now()
+          syncState = 'running'
+          syncRunningSince = new Date().toISOString()
+          syncLastError = null
+          syncLogLines = ['Iniciando sincronização Read-Only das bibliotecas Eagle...']
+
+          const pushLog = (chunk: Buffer | string) => {
+            const lines = String(chunk)
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter(Boolean)
+            if (lines.length === 0) return
+            syncLogLines = [...syncLogLines, ...lines].slice(-14)
+          }
+
+          const child = spawn('python', ['-u', 'scripts/ingest_google_flow.py', '--stage-only'], {
+            cwd: projectRoot,
+            env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
+          })
+          activeSyncProc = child
+          child.stdout?.on('data', pushLog)
+          child.stderr?.on('data', pushLog)
+
+          child.on('error', (err) => {
+            activeSyncProc = null
+            syncState = 'error'
+            syncRunningSince = null
+            syncLastError = err.message
+          })
+
+          child.on('close', (code) => {
+            void (async () => {
+              activeSyncProc = null
+              const stagedDb = `${dbPath}.next`
+              const stagedSuite = `${suiteJsonPath}.next`
+              if (code === 0 && fs.existsSync(stagedDb) && fs.existsSync(stagedSuite)) {
+                try {
+                  closeDbHandle()
+                  for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) {
+                    if (fs.existsSync(sidecar)) {
+                      try {
+                        await fsp.unlink(sidecar)
+                      } catch {
+                        // ignore stale sidecar
+                      }
+                    }
+                  }
+                  await replaceFileWithRetry(stagedDb, dbPath)
+                  await replaceFileWithRetry(stagedSuite, suiteJsonPath)
+
+                  dbMtimeMs = 0
+                  astCacheSnapshotMtime = 0
+                  eagleMtimeCache.clear()
+                  thumbnailRamCache.clear()
+                  cachedTimelineInsights = null
+                  cachedEngineMapById.clear()
+                  cachedEngineFolderById.clear()
+                  tagCountCache.clear()
+                  ensureDbLoaded()
+
+                  syncState = 'idle'
+                  syncLastError = null
+                  syncRunningSince = null
+                  syncLastDurationMs = Date.now() - tStart
+                } catch (swapErr) {
+                  syncState = 'error'
+                  syncRunningSince = null
+                  syncLastError = swapErr instanceof Error ? swapErr.message : String(swapErr)
+                }
+              } else {
+                for (const tmpNext of [stagedDb, stagedSuite]) {
+                  if (fs.existsSync(tmpNext)) {
+                    fsp.unlink(tmpNext).catch(() => null)
+                  }
+                }
+                syncState = 'error'
+                syncRunningSince = null
+                syncLastError =
+                  syncLogLines[syncLogLines.length - 1] ||
+                  `Sincronização encerrou com código ${code ?? 'desconhecido'}.`
+              }
+            })()
+          })
+
+          sendJson(res, 202, buildSyncStatus())
+          return
+        }
+
         if (req.method === 'GET' && (url === '/api/suite' || url === '/api/collection')) {
           try {
+            promoteStagedIfPresent()
             const targetPath = fs.existsSync(suiteJsonPath)
               ? suiteJsonPath
               : fs.existsSync(sampleJsonPath)
@@ -558,6 +1406,148 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
               return true
             })
             sendJson(res, 200, { total: filtered.length, points: filtered })
+          } catch (err) {
+            sendJson(res, 500, { error: String(err) })
+          }
+          return
+        }
+
+        if (req.method === 'GET' && url === '/api/lab-engine-map') {
+          try {
+            const database = ensureDbLoaded()
+            if (!database) {
+              sendJson(res, 404, { error: 'Banco SQLite não encontrado.' })
+              return
+            }
+            if (cachedEngineMapById.size === 0) {
+              const rows = database
+                .prepare(
+                  'SELECT id, project_name, folders_json, macro_format, kernel_dialect, clean_prompt, eagle_tags_json FROM prompts'
+                )
+                .all() as Array<Record<string, unknown>>
+              const nextMap = new Map<string, LabEngineId>()
+              const nextFolderMap = new Map<string, string>()
+              for (const r of rows) {
+                const id = String(r.id)
+                nextMap.set(
+                  id,
+                  classifyPromptEngine(
+                    String(r.clean_prompt || ''),
+                    String(r.eagle_tags_json || ''),
+                    String(r.macro_format || ''),
+                    String(r.kernel_dialect || '')
+                  )
+                )
+                const projectName = String(r.project_name || '').trim()
+                let folderDisplay = ''
+                try {
+                  const parsedFolders = JSON.parse(String(r.folders_json || '[]')) as unknown
+                  if (Array.isArray(parsedFolders)) {
+                    const firstFolder = parsedFolders
+                      .find((item): item is string => typeof item === 'string' && item.trim().length > 0)
+                      ?.trim()
+                    if (firstFolder && firstFolder.includes('/') && firstFolder !== projectName) {
+                      folderDisplay =
+                        projectName && firstFolder.startsWith(`${projectName}/`)
+                          ? firstFolder.slice(projectName.length + 1).trim()
+                          : firstFolder
+                    }
+                  }
+                } catch {
+                  // ignora folders_json malformado
+                }
+                if (folderDisplay) {
+                  nextFolderMap.set(id, folderDisplay)
+                }
+              }
+              cachedEngineMapById = nextMap
+              cachedEngineFolderById = nextFolderMap
+            }
+
+            const sourceLib = params.get('sourceLib') || 'google_flow'
+            const project = params.get('project') || 'all'
+            const filtered = cachedPoints.filter((p) => {
+              if (sourceLib !== 'all' && p.sourceLib !== sourceLib) return false
+              if (project !== 'all' && p.project !== project) return false
+              return true
+            })
+
+            interface EngineAcc {
+              count: number
+              pctSum: number
+              tierSCount: number
+              projects: Map<string, number>
+            }
+            const accByEngine = new Map<LabEngineId, EngineAcc>()
+            for (const p of filtered) {
+              const engId = cachedEngineMapById.get(p.id) ?? 'qwen_natural'
+              let acc = accByEngine.get(engId)
+              if (!acc) {
+                acc = { count: 0, pctSum: 0, tierSCount: 0, projects: new Map() }
+                accByEngine.set(engId, acc)
+              }
+              acc.count += 1
+              acc.pctSum += p.percentile
+              if (p.tier === 'S') acc.tierSCount += 1
+              acc.projects.set(p.project, (acc.projects.get(p.project) || 0) + 1)
+            }
+
+            const radiusByEngine = new Map<LabEngineId, number>()
+            const totalFiltered = filtered.length
+            const clusters = LAB_ENGINE_CATALOG.flatMap((meta) => {
+              const acc = accByEngine.get(meta.engineId)
+              if (!acc || acc.count === 0) return []
+              const radius = Math.max(82, Math.min(340, Math.round(62 + Math.sqrt(acc.count) * 2.85)))
+              radiusByEngine.set(meta.engineId, radius)
+              let dominantProject = 'Diversos'
+              let bestProjCount = -1
+              for (const [projName, cnt] of acc.projects.entries()) {
+                if (cnt > bestProjCount) {
+                  bestProjCount = cnt
+                  dominantProject = projName
+                }
+              }
+              return [
+                {
+                  clusterId: meta.clusterId,
+                  engineId: meta.engineId,
+                  label: meta.label,
+                  family: meta.family,
+                  color: meta.color,
+                  description: meta.description,
+                  cx: meta.cx,
+                  cy: meta.cy,
+                  radius,
+                  count: acc.count,
+                  sharePct: totalFiltered > 0 ? Number(((acc.count / totalFiltered) * 100).toFixed(1)) : 0,
+                  avgPercentile: Number((acc.pctSum / acc.count).toFixed(1)),
+                  tierSCount: acc.tierSCount,
+                  dominantProject,
+                },
+              ]
+            }).sort((a, b) => b.count - a.count)
+
+            const enginePoints = filtered.map((p) => {
+              const engId = cachedEngineMapById.get(p.id) ?? 'qwen_natural'
+              const meta = LAB_ENGINE_BY_ID.get(engId) ?? LAB_ENGINE_CATALOG[LAB_ENGINE_CATALOG.length - 1]
+              const radius = radiusByEngine.get(engId) ?? 120
+              const theta = Math.atan2(p.y, p.x) + (hashUnit(`${p.id}:ang`) - 0.5) * 0.65
+              const radial = radius * 0.87 * Math.sqrt(0.03 + 0.94 * hashUnit(`${p.id}:rad`))
+              const folder = cachedEngineFolderById.get(p.id)
+              return {
+                id: p.id,
+                c: meta.clusterId,
+                x: Number((meta.cx + Math.cos(theta) * radial).toFixed(1)),
+                y: Number((meta.cy + Math.sin(theta) * radial).toFixed(1)),
+                ...(folder ? { f: folder } : {}),
+              }
+            })
+
+            sendJson(res, 200, {
+              total: totalFiltered,
+              clusters,
+              points: enginePoints,
+            })
           } catch (err) {
             sendJson(res, 500, { error: String(err) })
           }
@@ -748,13 +1738,17 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
             }
             const item = hydratePromptRow(row)
 
-            // Busca os 8 vizinhos semânticos mais próximos via dot product nos 24d cachedVecs
+            // Busca os N vizinhos semânticos mais próximos via dot product nos 24d cachedVecs
+            const rawLimit = Number.parseInt(params.get('limit') || '8', 10)
+            const neighborLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(24, rawLimit)) : 8
+            const scopeSourceLib = params.get('sourceLib') || 'all'
             const idx = cachedIdToIdx.get(itemId)
             const scored: Array<{ id: string; sem: number }> = []
             if (idx !== undefined && cachedPoints.length > 0) {
               const offA = idx * 24
               for (let j = 0; j < cachedPoints.length; j++) {
                 if (j === idx) continue
+                if (scopeSourceLib !== 'all' && cachedPoints[j].sourceLib !== scopeSourceLib) continue
                 const offB = j * 24
                 let dot = 0
                 for (let d = 0; d < 24; d++) {
@@ -767,7 +1761,7 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
               scored.sort((a, b) => b.sem - a.sem)
             }
 
-            const topIds = scored.slice(0, 8)
+            const topIds = scored.slice(0, neighborLimit)
             const neighbors: Array<{ item: PromptItem; semanticSim: number; structuralSim: number }> = []
             if (topIds.length > 0) {
               const placeholders = topIds.map(() => '?').join(',')
@@ -801,6 +1795,37 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
             sendJson(res, 200, { item, neighbors })
           } catch (err) {
             sendJson(res, 500, { error: String(err) })
+          }
+          return
+        }
+
+        if (req.method === 'GET' && url.startsWith('/api/image/')) {
+          const cleanUrl = url.split('?')[0]
+          const parts = cleanUrl.replace('/api/image/', '').split('/')
+          if (parts.length !== 2) {
+            res.statusCode = 400
+            res.end('Invalid image path')
+            return
+          }
+          const [sourceLib, itemId] = parts
+          const filePath = resolveEagleFullImagePath(sourceLib, itemId)
+          if (!filePath) {
+            res.statusCode = 404
+            res.end('Image not found')
+            return
+          }
+
+          try {
+            const buf = await fsp.readFile(filePath)
+            const ext = path.extname(filePath).toLowerCase()
+            const mime = MIME_MAP[ext] || 'application/octet-stream'
+            res.statusCode = 200
+            res.setHeader('Content-Type', mime)
+            res.setHeader('Cache-Control', 'public, max-age=3600')
+            res.end(buf)
+          } catch {
+            res.statusCode = 404
+            res.end('Unable to read image')
           }
           return
         }
@@ -872,6 +1897,20 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
           return
         }
 
+        if (req.method === 'GET' && url === '/api/gap-missions') {
+          try {
+            const drafts = await readGapDrafts()
+            const database = ensureDbLoaded()
+            const { testedBridges, totalTestedPrompts } = database
+              ? readTestedBridgesFromDb(database)
+              : { testedBridges: [], totalTestedPrompts: 0 }
+            sendJson(res, 200, { drafts, testedBridges, totalTestedPrompts })
+          } catch (err) {
+            sendJson(res, 500, { error: String(err) })
+          }
+          return
+        }
+
         if (req.method === 'GET' && url === '/api/gap-drafts') {
           try {
             const drafts = await readGapDrafts()
@@ -892,12 +1931,29 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
               return
             }
             const nowIso = new Date().toISOString()
+            const reqStatus: GapMissionStage =
+              body.status === 'copied' || body.status === 'tested' ? body.status : 'forged'
+            const upsertByGapId = body.upsertByGapId === true
+            const existing = await readGapDrafts()
+            const prevForGap = upsertByGapId ? existing.find((d) => d.gapId === gapId) : undefined
+
+            const statusRank: Record<GapMissionStage, number> = { copied: 1, forged: 2, tested: 3 }
+            const resolvedStatus: GapMissionStage =
+              prevForGap?.status && statusRank[prevForGap.status] > statusRank[reqStatus] && body.forceStatus !== true
+                ? prevForGap.status
+                : reqStatus
+
             const draft: GapDraftRecord = {
               id:
                 typeof body.id === 'string' && body.id.trim()
                   ? body.id.trim()
-                  : `draft_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-              createdAt: typeof body.createdAt === 'string' && body.createdAt ? body.createdAt : nowIso,
+                  : prevForGap?.id || `draft_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+              createdAt:
+                typeof body.createdAt === 'string' && body.createdAt
+                  ? body.createdAt
+                  : prevForGap?.createdAt || nowIso,
+              updatedAt: nowIso,
+              status: resolvedStatus,
               gapId,
               gapTitle: typeof body.gapTitle === 'string' ? body.gapTitle : gapId,
               scope: typeof body.scope === 'string' ? body.scope : 'all',
@@ -909,6 +1965,7 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
               tagC: typeof body.tagC === 'string' ? body.tagC : undefined,
               donorAId: typeof body.donorAId === 'string' ? body.donorAId : null,
               donorBId: typeof body.donorBId === 'string' ? body.donorBId : null,
+              donorCId: typeof body.donorCId === 'string' ? body.donorCId : null,
               macroFormat:
                 body.macroFormat === 'json' || body.macroFormat === 'sections'
                   ? body.macroFormat
@@ -929,8 +1986,10 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
               filledAttributesCount: Number(body.filledAttributesCount || 8),
             }
 
-            const existing = await readGapDrafts()
-            const nextDrafts = [draft, ...existing.filter((d) => d.id !== draft.id)].slice(0, 200)
+            const nextDrafts = [
+              draft,
+              ...existing.filter((d) => (upsertByGapId ? d.gapId !== gapId && d.id !== draft.id : d.id !== draft.id)),
+            ].slice(0, 250)
             await writeGapDrafts(nextDrafts)
             sendJson(res, 200, { draft, drafts: nextDrafts })
           } catch (err) {
@@ -1227,6 +2286,246 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
           return
         }
 
+        if (req.method === 'GET' && url === '/api/experiments/sample') {
+          try {
+            const database = ensureDbLoaded()
+            if (!database) {
+              sendJson(res, 404, { error: 'Banco SQLite não encontrado.' })
+              return
+            }
+
+            const mode = params.get('mode') === 'drift' ? 'drift' : 'antithesis'
+            const sourceLib = params.get('sourceLib') || 'all'
+            const seedId = (params.get('seedId') || '').trim()
+            const reqProjA = (params.get('projectA') || '').trim()
+            const reqProjB = (params.get('projectB') || '').trim()
+
+            const hydrateByIds = (ids: string[]): Map<string, PromptItem> => {
+              const unique = Array.from(new Set(ids.filter(Boolean)))
+              const out = new Map<string, PromptItem>()
+              if (unique.length === 0) return out
+              const placeholders = unique.map(() => '?').join(',')
+              const rows = database
+                .prepare(`SELECT * FROM prompts WHERE id IN (${placeholders})`)
+                .all(...unique) as Array<Record<string, unknown>>
+              for (const r of rows) {
+                const it = hydratePromptRow(r)
+                out.set(it.id, it)
+              }
+              return out
+            }
+
+            const pickWithThumb = (candidates: MapPointCompact[], count: number): MapPointCompact[] => {
+              const shuffled = [...candidates]
+              for (let i = shuffled.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1))
+                const tmp = shuffled[i]
+                shuffled[i] = shuffled[j]
+                shuffled[j] = tmp
+              }
+              const withThumb: MapPointCompact[] = []
+              const withoutThumb: MapPointCompact[] = []
+              for (let i = 0; i < shuffled.length && withThumb.length < count; i++) {
+                const pt = shuffled[i]
+                if (resolveEagleThumbnailPath(pt.sourceLib, pt.id)) {
+                  withThumb.push(pt)
+                } else if (withoutThumb.length < count) {
+                  withoutThumb.push(pt)
+                }
+              }
+              while (withThumb.length < count && withoutThumb.length > 0) {
+                const nextPt = withoutThumb.shift()
+                if (nextPt) withThumb.push(nextPt)
+              }
+              return withThumb
+            }
+
+            const basePool = cachedPoints.filter(
+              (p) => (sourceLib === 'all' || p.sourceLib === sourceLib) && p.maturity >= 55
+            )
+            const workingPool = basePool.length >= 12 ? basePool : cachedPoints
+
+            if (mode === 'antithesis') {
+              const maturePool = workingPool.filter((p) => p.maturity >= 65)
+              const seedPool = maturePool.length >= 12 ? maturePool : workingPool
+              let ptA: MapPointCompact | undefined
+              if (seedId && cachedIdToIdx.has(seedId)) {
+                ptA = cachedPoints[cachedIdToIdx.get(seedId)!]
+              }
+              if (!ptA) {
+                const picked = pickWithThumb(seedPool.slice(0, 1200), 1)
+                ptA = picked[0] ?? seedPool[Math.floor(Math.random() * seedPool.length)]
+              }
+              if (!ptA) {
+                sendJson(res, 404, { error: 'Nenhum prompt disponível para antítese.' })
+                return
+              }
+
+              const idxA = cachedIdToIdx.get(ptA.id)
+              const antipodeScored: Array<{ pt: MapPointCompact; dot: number }> = []
+              if (idxA !== undefined) {
+                const offA = idxA * 24
+                for (let j = 0; j < cachedPoints.length; j++) {
+                  const ptB = cachedPoints[j]
+                  if (ptB.id === ptA.id) continue
+                  if (sourceLib !== 'all' && ptB.sourceLib !== sourceLib) continue
+                  if (ptB.clusterId === ptA.clusterId) continue
+                  if (ptB.maturity < 60) continue
+                  const offB = j * 24
+                  let dot = 0
+                  for (let d = 0; d < 24; d++) {
+                    dot += cachedVecs[offA + d] * cachedVecs[offB + d]
+                  }
+                  antipodeScored.push({ pt: ptB, dot })
+                }
+                antipodeScored.sort((a, b) => a.dot - b.dot)
+              }
+
+              // Seleciona antípodas diversos (priorizando projetos diferentes e com miniatura em disco)
+              const topAntipodes: Array<{ pt: MapPointCompact; dot: number }> = []
+              const seenProj = new Set<string>()
+              for (const cand of antipodeScored.slice(0, 80)) {
+                if (topAntipodes.length >= 8) break
+                if (cand.pt.project === ptA.project && topAntipodes.length < 4) continue
+                if (seenProj.has(cand.pt.project) && topAntipodes.length < 5) continue
+                if (!resolveEagleThumbnailPath(cand.pt.sourceLib, cand.pt.id) && topAntipodes.length >= 2) {
+                  continue
+                }
+                seenProj.add(cand.pt.project)
+                topAntipodes.push(cand)
+              }
+              for (const cand of antipodeScored.slice(0, 24)) {
+                if (topAntipodes.length >= 8) break
+                if (!topAntipodes.some((x) => x.pt.id === cand.pt.id)) {
+                  topAntipodes.push(cand)
+                }
+              }
+
+              const extraA = pickWithThumb(
+                seedPool.filter((p) => p.id !== ptA!.id && p.clusterId !== ptA!.clusterId),
+                5
+              )
+
+              const idMap = hydrateByIds([
+                ptA.id,
+                ...topAntipodes.map((x) => x.pt.id),
+                ...extraA.map((x) => x.id),
+              ])
+              const poleA = idMap.get(ptA.id)
+              if (!poleA) {
+                sendJson(res, 404, { error: 'Polo A não encontrado no SQLite.' })
+                return
+              }
+
+              const antipodes = topAntipodes
+                .map((x) => {
+                  const item = idMap.get(x.pt.id)
+                  if (!item) return null
+                  const clamped = Math.max(-1, Math.min(1, x.dot))
+                  return {
+                    item,
+                    cosineSim: Number(clamped.toFixed(3)),
+                    angularDeg: Math.round(Math.acos(clamped) * (180 / Math.PI)),
+                  }
+                })
+                .filter((x): x is { item: PromptItem; cosineSim: number; angularDeg: number } =>
+                  Boolean(x)
+                )
+
+              const poleAPool = [
+                poleA,
+                ...extraA
+                  .map((p) => idMap.get(p.id))
+                  .filter((x): x is PromptItem => Boolean(x)),
+              ]
+
+              sendJson(res, 200, {
+                mode: 'antithesis',
+                poleA,
+                antipodes,
+                poleAPool,
+              })
+              return
+            }
+
+            // mode === 'drift' (Sonda de Deriva Cross-Projeto)
+            const byProject = new Map<string, MapPointCompact[]>()
+            for (const p of workingPool) {
+              if (p.project === 'Sem Projeto') continue
+              const arr = byProject.get(p.project) || []
+              arr.push(p)
+              byProject.set(p.project, arr)
+            }
+            const projectNames = Array.from(byProject.keys()).filter(
+              (name) => (byProject.get(name)?.length || 0) >= 3
+            )
+            const safeProjects =
+              projectNames.length >= 2 ? projectNames : Array.from(byProject.keys())
+
+            const shuffledProjects = [...safeProjects].sort(() => Math.random() - 0.5)
+            const projA =
+              reqProjA && byProject.has(reqProjA)
+                ? reqProjA
+                : shuffledProjects[0] || workingPool[0]?.project || 'Sem Projeto'
+            const projB =
+              reqProjB && reqProjB !== projA && byProject.has(reqProjB)
+                ? reqProjB
+                : shuffledProjects.find((n) => n !== projA) || projA
+            const projC = shuffledProjects.find((n) => n !== projA && n !== projB) || projB
+
+            const listA = byProject.get(projA) || workingPool
+            const listB = byProject.get(projB) || workingPool
+            const listC = byProject.get(projC) || workingPool
+
+            const poolAPts = pickWithThumb(listA, 6)
+            const ptA = poolAPts[0] || listA[0]
+            const poolBPts = pickWithThumb(
+              listB.filter((p) => p.id !== ptA?.id && p.clusterId !== ptA?.clusterId),
+              6
+            )
+            const ptB = poolBPts[0] || listB.find((p) => p.id !== ptA?.id) || listB[0]
+            const poolCPts = pickWithThumb(
+              listC.filter((p) => p.id !== ptA?.id && p.id !== ptB?.id),
+              2
+            )
+            const ptC = poolCPts[0] || null
+
+            const idMap = hydrateByIds([
+              ...(ptA ? [ptA.id] : []),
+              ...(ptB ? [ptB.id] : []),
+              ...(ptC ? [ptC.id] : []),
+              ...poolAPts.map((p) => p.id),
+              ...poolBPts.map((p) => p.id),
+            ])
+
+            const donorA = ptA ? idMap.get(ptA.id) : undefined
+            const donorB = ptB ? idMap.get(ptB.id) : undefined
+            if (!donorA || !donorB) {
+              sendJson(res, 404, { error: 'Doadores insuficientes para sonda de deriva.' })
+              return
+            }
+
+            const poolA = poolAPts
+              .map((p) => idMap.get(p.id))
+              .filter((x): x is PromptItem => Boolean(x))
+            const poolB = poolBPts
+              .map((p) => idMap.get(p.id))
+              .filter((x): x is PromptItem => Boolean(x))
+
+            sendJson(res, 200, {
+              mode: 'drift',
+              donorA,
+              donorB,
+              donorC: ptC ? idMap.get(ptC.id) || null : null,
+              poolA,
+              poolB,
+            })
+          } catch (err) {
+            sendJson(res, 500, { error: String(err) })
+          }
+          return
+        }
+
         if (req.method === 'POST' && url === '/api/decompose-preview') {
           try {
             const body = await readJsonBody(req)
@@ -1249,7 +2548,6 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
                   .map(sanitizeCanonicalTag)
                   .filter(Boolean)
               : []
-            const knownGapZero = body.knownGapZero === true
 
             if (!rawPrompt.trim()) {
               sendJson(res, 400, { error: 'rawPrompt obrigatório' })
@@ -1258,7 +2556,7 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
 
             const { cleanPrompt, excerpt, attributes } = decomposePrompt(rawPrompt, { project })
             const database = ensureDbLoaded()
-            const corpusSize = cachedPoints.length || 22282
+            const corpusSize = cachedPoints.length || 1
             const hasSubstantiveBody =
               attributes.estrutura.filledAttributesCount >= 6 && cleanPrompt.length >= 60
 
@@ -1299,35 +2597,38 @@ const DECOMPOSER_EST_TO_CLEAN_FTS: Record<string, string> = {
             if (database && targetTags.length >= 2) {
               try {
                 const ftsClauses = targetTags
-                  .map((tt) => `tags_text : "${DECOMPOSER_TO_SQLITE_TAG[tt] || tt}"`)
+                  .map((tt) => buildTagFtsClause(tt))
+                  .filter((c): c is string => Boolean(c))
                   .join(' AND ')
-                if (isNamedProjectScope(scope)) {
-                  const row = database
-                    .prepare(
-                      'SELECT COUNT(*) AS cnt FROM prompts JOIN prompts_fts ON prompts.id = prompts_fts.id WHERE prompts_fts MATCH ? AND prompts.project_name = ?'
-                    )
-                    .get(ftsClauses, scope) as { cnt: number } | undefined
-                  secondaryFtsOccurrences = Number(row?.cnt || 0)
-                } else if (scope.startsWith('Google Flow')) {
-                  const row = database
-                    .prepare(
-                      "SELECT COUNT(*) AS cnt FROM prompts JOIN prompts_fts ON prompts.id = prompts_fts.id WHERE prompts_fts MATCH ? AND prompts.source_lib = 'google_flow'"
-                    )
-                    .get(ftsClauses) as { cnt: number } | undefined
-                  secondaryFtsOccurrences = Number(row?.cnt || 0)
-                } else {
-                  const row = database
-                    .prepare('SELECT COUNT(*) AS cnt FROM prompts_fts WHERE prompts_fts MATCH ?')
-                    .get(ftsClauses) as { cnt: number } | undefined
-                  secondaryFtsOccurrences = Number(row?.cnt || 0)
+                if (ftsClauses) {
+                  if (isNamedProjectScope(scope)) {
+                    const row = database
+                      .prepare(
+                        'SELECT COUNT(*) AS cnt FROM prompts JOIN prompts_fts ON prompts.id = prompts_fts.id WHERE prompts_fts MATCH ? AND prompts.project_name = ?'
+                      )
+                      .get(ftsClauses, scope) as { cnt: number } | undefined
+                    secondaryFtsOccurrences = Number(row?.cnt || 0)
+                  } else if (scope.startsWith('Google Flow')) {
+                    const row = database
+                      .prepare(
+                        "SELECT COUNT(*) AS cnt FROM prompts JOIN prompts_fts ON prompts.id = prompts_fts.id WHERE prompts_fts MATCH ? AND prompts.source_lib = 'google_flow'"
+                      )
+                      .get(ftsClauses) as { cnt: number } | undefined
+                    secondaryFtsOccurrences = Number(row?.cnt || 0)
+                  } else {
+                    const row = database
+                      .prepare('SELECT COUNT(*) AS cnt FROM prompts_fts WHERE prompts_fts MATCH ?')
+                      .get(ftsClauses) as { cnt: number } | undefined
+                    secondaryFtsOccurrences = Number(row?.cnt || 0)
+                  }
                 }
               } catch {
                 secondaryFtsOccurrences = 0
               }
             }
 
-            const exactGapOccurrences =
-              knownGapZero && hasSubstantiveBody ? 0 : secondaryFtsOccurrences
+            // Retorna sempre a contagem real do FTS5 sem mascarar ocorrências preexistentes
+            const exactGapOccurrences = secondaryFtsOccurrences
 
             const pairRarityBonus =
               targetTags.length >= 2 && hasSubstantiveBody
